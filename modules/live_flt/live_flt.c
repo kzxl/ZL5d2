@@ -32,14 +32,25 @@
 #include <bmp.h>
 #include <vram.h>
 
-static CONFIG_INT("live_flt.mode", live_flt_mode, 0);       /* 0: Off, 1: Live GND, 2: Monochrome, 3: ND Sim */
+static CONFIG_INT("live_flt.mode", live_flt_mode, 0);       /* 0: Off, 1: Live GND, 2: Monochrome, 3: ND Sim, 4: Film Sim */
 static CONFIG_INT("live_flt.gnd_ev", live_flt_gnd_ev, 2);   /* 1 to 4 stops attenuation for GND sky */
 static CONFIG_INT("live_flt.gnd_pos", live_flt_gnd_pos, 45); /* Horizon level: 10% to 90% */
 static CONFIG_INT("live_flt.gnd_soft", live_flt_gnd_soft, 1);/* 0: Hard transition, 1: Soft transition */
 static CONFIG_INT("live_flt.nd_ev", live_flt_nd_ev, 3);     /* 1 to 6 stops attenuation for ND simulation */
+static CONFIG_INT("live_flt.film", live_flt_film, 0);       /* 0: Portra 400, 1: Velvia 50, 2: Kodachrome 64, 3: Classic Chrome, 4: CineStill 800T, 5: Ilford HP5, 6: Tri-X 400, 7: Sepia */
 
-static const char * mode_choices[] = { "OFF", "Live GND", "Monochrome B&W", "Live ND Sim" };
+static const char * mode_choices[] = { "OFF", "Live GND", "Monochrome B&W", "Live ND Sim", "Film Simulation" };
 static const char * gnd_soft_choices[] = { "Hard Edge", "Soft Edge" };
+static const char * film_choices[] = {
+    "Kodak Portra 400",
+    "Fuji Velvia 50",
+    "Kodak Kodachrome 64",
+    "Fuji Classic Chrome",
+    "CineStill 800T",
+    "Ilford HP5+ 400",
+    "Kodak Tri-X 400",
+    "Sepia Vintage"
+};
 
 static unsigned int live_flt_display_cbr(unsigned int ctx)
 {
@@ -207,6 +218,77 @@ static unsigned int live_flt_display_cbr(unsigned int ctx)
             }
         }
     }
+    else if (live_flt_mode == 4) /* Real-Time Film Simulation */
+    {
+        int sat = 256, cross = 0, u_tint = 0, v_tint = 0, c_slope = 256, b_lvl = 0;
+        switch (live_flt_film)
+        {
+            case 0: /* Kodak Portra 400 */
+                sat = 230; cross = -15; u_tint = -8; v_tint = 12; c_slope = 230; b_lvl = 6;
+                break;
+            case 1: /* Fuji Velvia 50 */
+                sat = 340; cross = 20; u_tint = 10; v_tint = 14; c_slope = 300; b_lvl = 0;
+                break;
+            case 2: /* Kodak Kodachrome 64 */
+                sat = 280; cross = 10; u_tint = -4; v_tint = 22; c_slope = 280; b_lvl = 2;
+                break;
+            case 3: /* Fuji Classic Chrome */
+                sat = 195; cross = 0; u_tint = -6; v_tint = 4; c_slope = 270; b_lvl = 1;
+                break;
+            case 4: /* CineStill 800T */
+                sat = 260; cross = -30; u_tint = 24; v_tint = -12; c_slope = 260; b_lvl = 8;
+                break;
+            case 5: /* Ilford HP5+ */
+                sat = 0; cross = 0; u_tint = 0; v_tint = 0; c_slope = 250; b_lvl = 4;
+                break;
+            case 6: /* Kodak Tri-X 400 */
+                sat = 0; cross = 0; u_tint = 0; v_tint = 0; c_slope = 340; b_lvl = 0;
+                break;
+            case 7: /* Sepia Vintage */
+                sat = 40; cross = 0; u_tint = -20; v_tint = 28; c_slope = 240; b_lvl = 12;
+                break;
+            default:
+                break;
+        }
+
+        for (int y = 0; y < height; y++)
+        {
+            uint32_t * row_src = src + y * dwords_per_row;
+            uint32_t * row_dst = dst + y * dwords_per_row;
+
+            for (int x = 0; x < dwords_visible; x++)
+            {
+                uint32_t p = row_src[x];
+                int u_raw  = (int)(p & 0xFF) - 128;
+                int y0_raw = (int)((p >> 8) & 0xFF) - 128;
+                int v_raw  = (int)((p >> 16) & 0xFF) - 128;
+                int y1_raw = (int)((p >> 24) & 0xFF) - 128;
+
+                int y0 = 128 + ((y0_raw * c_slope) >> 8) + b_lvl;
+                int y1 = 128 + ((y1_raw * c_slope) >> 8) + b_lvl;
+                if (y0 < 0) y0 = 0; else if (y0 > 255) y0 = 255;
+                if (y1 < 0) y1 = 0; else if (y1 > 255) y1 = 255;
+
+                int u = 128, v = 128;
+                if (sat > 0)
+                {
+                    int u_scaled = ((u_raw * sat + v_raw * cross) >> 8) + u_tint;
+                    int v_scaled = ((v_raw * sat - u_raw * cross) >> 8) + v_tint;
+                    u = u_scaled + 128;
+                    v = v_scaled + 128;
+                    if (u < 0) u = 0; else if (u > 255) u = 255;
+                    if (v < 0) v = 0; else if (v > 255) v = 255;
+                }
+
+                row_dst[x] = (uint32_t)u | ((uint32_t)y0 << 8) | ((uint32_t)v << 16) | ((uint32_t)y1 << 24);
+            }
+
+            if (dwords_per_row > dwords_visible && row_dst != row_src)
+            {
+                memcpy(row_dst + dwords_visible, row_src + dwords_visible, (dwords_per_row - dwords_visible) * sizeof(uint32_t));
+            }
+        }
+    }
 
     return 1;
 }
@@ -229,6 +311,10 @@ static MENU_UPDATE_FUNC(live_flt_main_update)
     {
         MENU_SET_VALUE("Live ND (-%d EV)", live_flt_nd_ev);
     }
+    else if (live_flt_mode == 4)
+    {
+        MENU_SET_VALUE("%s", film_choices[live_flt_film % COUNT(film_choices)]);
+    }
 }
 
 static struct menu_entry live_flt_menu[] =
@@ -237,18 +323,25 @@ static struct menu_entry live_flt_menu[] =
         .name = "Live Filter",
         .priv = &live_flt_mode,
         .update = live_flt_main_update,
-        .max = 3,
+        .max = 4,
         .choices = mode_choices,
-        .help = "Real-time computational optical filters on LiveView LCD.",
+        .help = "Real-time optical filters and film simulations on LiveView LCD.",
         .depends_on = DEP_LIVEVIEW,
         .children = (struct menu_entry[])
         {
             {
                 .name = "Filter Mode",
                 .priv = &live_flt_mode,
-                .max = 3,
+                .max = 4,
                 .choices = mode_choices,
-                .help = "Select active real-time optical filter simulation.",
+                .help = "Select active real-time optical or film simulation.",
+            },
+            {
+                .name = "Film Stock",
+                .priv = &live_flt_film,
+                .max = 7,
+                .choices = film_choices,
+                .help = "Select legendary film simulation profile.",
             },
             {
                 .name = "GND Sky Attenuation",
@@ -310,4 +403,5 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(live_flt_gnd_pos)
     MODULE_CONFIG(live_flt_gnd_soft)
     MODULE_CONFIG(live_flt_nd_ev)
+    MODULE_CONFIG(live_flt_film)
 MODULE_CONFIGS_END()

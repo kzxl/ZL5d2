@@ -7,6 +7,8 @@
 
 #![no_std]
 
+pub mod film_sim;
+pub use film_sim::{FilmProfile, FilmStock};
 use zero_d4::VramSurface;
 
 // ------------------------------------------------------------------------
