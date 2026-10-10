@@ -100,6 +100,40 @@ impl RawHistogram {
 }
 
 // ------------------------------------------------------------------------
+// Focus Peaking Real-Time Overlay
+// ------------------------------------------------------------------------
+pub struct FocusPeaking;
+
+impl FocusPeaking {
+    /// Renders highlight dots onto a VramSurface where edge contrast exceeds threshold.
+    pub fn render_peaking(
+        vram: &mut VramSurface<'_>,
+        luminance: &[u8],
+        threshold: u8,
+        peak_color: u8,
+    ) {
+        let w = vram.width();
+        let h = vram.height();
+        if luminance.len() < w * h {
+            return;
+        }
+
+        // Fast horizontal gradient operator
+        for y in 1..h - 1 {
+            let row = y * w;
+            for x in 1..w - 1 {
+                let left = luminance[row + x - 1] as i16;
+                let right = luminance[row + x + 1] as i16;
+                let diff = (right - left).abs() as u8;
+                if diff > threshold {
+                    vram.put_pixel_fast(x, y, peak_color);
+                }
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------------
 // C ABI Export for Magic Lantern Integration
 // ------------------------------------------------------------------------
 #[no_mangle]

@@ -15,6 +15,7 @@ use zero_d4_sys as sys;
 struct D4CriticalSection;
 critical_section::set_impl!(D4CriticalSection);
 
+#[cfg(target_arch = "arm")]
 unsafe impl critical_section::Impl for D4CriticalSection {
     unsafe fn acquire() -> critical_section::RawRestoreState {
         let old_cpsr: u32;
@@ -41,6 +42,14 @@ unsafe impl critical_section::Impl for D4CriticalSection {
             options(nomem, nostack)
         );
     }
+}
+
+#[cfg(not(target_arch = "arm"))]
+unsafe impl critical_section::Impl for D4CriticalSection {
+    unsafe fn acquire() -> critical_section::RawRestoreState {
+        0
+    }
+    unsafe fn release(_restore_state: critical_section::RawRestoreState) {}
 }
 
 // ------------------------------------------------------------------------
