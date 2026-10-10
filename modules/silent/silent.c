@@ -20,6 +20,7 @@
 #include "../lv_rec/lv_rec.h"
 #include "../raw_video/mlv_rec/mlv.h"
 #include "lossless.h"
+#include "jpeg_enc.h"
 
 static uint64_t ret_0_long() { return 0; }
 
@@ -59,6 +60,7 @@ static CONFIG_INT( "silent.pic.file_format", silent_pic_file_format, 0 );
 #define SILENT_PIC_FILE_FORMAT_DNG 0
 #define SILENT_PIC_FILE_FORMAT_MLV 1
 #define SILENT_PIC_FILE_FORMAT_LOSSLESS_DNG 2
+#define SILENT_PIC_FILE_FORMAT_JPEG 3
 
 #define SILENT_PIC_MODE_SLITSCAN_SCAN_TTB 0 // top to bottom
 #define SILENT_PIC_MODE_SLITSCAN_SCAN_BTT 1 // bottom to top
@@ -75,6 +77,17 @@ static uint32_t mlv_max_filesize = 0xFFFFFFFF;
 static int mlv_file_frame_number = 0;
 
 static int long_exposure_fix_enabled = 0;
+
+static void silent_log(const char * msg)
+{
+    FILE * f = FIO_CreateFileOrAppend("A:/silent.log");
+    if (f)
+    {
+        FIO_WriteFile(f, msg, strlen(msg));
+        FIO_WriteFile(f, "\n", 1);
+        FIO_CloseFile(f);
+    }
+}
 
 /* forward reference */
 static struct menu_entry silent_menu[];
@@ -162,6 +175,11 @@ static MENU_UPDATE_FUNC(silent_pic_display)
             MENU_SET_HELP("File format: 14-bit lossless DNG, individual files.");
             MENU_APPEND_VALUE(", L-DNG");
             break;
+
+        case SILENT_PIC_FILE_FORMAT_JPEG:
+            MENU_SET_HELP("File format: 8-bit Baseline JPEG (~300KB), fast & lightweight.");
+            MENU_APPEND_VALUE(", JPG");
+            break;
     }
     
     if (silent_pic_mode == SILENT_PIC_MODE_FULLRES && (shooting_mode != SHOOTMODE_M || is_movie_mode()))
@@ -180,6 +198,35 @@ static MENU_UPDATE_FUNC(silent_pic_display)
 static MENU_UPDATE_FUNC(silent_pic_file_format_display)
 {
     silent_pic_check_mlv(entry, info);
+    if (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_LOSSLESS_DNG && !lossless_init())
+    {
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Lossless DNG requires DIGIC 5 hardware.");
+    }
+}
+
+static const char* get_valid_dcim_dir()
+{
+    const char* dcim = get_dcim_dir();
+    if (dcim && is_dir(dcim))
+    {
+        return dcim;
+    }
+
+    /* Fallback if Canon property has not yet fired (e.g., in QEMU or early boot) */
+    static char fallback_dir[64];
+    const char* drv = get_shooting_card()->drive_letter;
+    if (!drv || !drv[0]) drv = "A";
+
+    snprintf(fallback_dir, sizeof(fallback_dir), "%s:/DCIM/100EOS5D", drv);
+    if (is_dir(fallback_dir)) return fallback_dir;
+
+    snprintf(fallback_dir, sizeof(fallback_dir), "%s:/DCIM/100CANON", drv);
+    if (is_dir(fallback_dir)) return fallback_dir;
+
+    snprintf(fallback_dir, sizeof(fallback_dir), "%s:/DCIM", drv);
+    if (is_dir(fallback_dir)) return fallback_dir;
+
+    return dcim;
 }
 
 static char* silent_pic_get_name()
@@ -190,6 +237,10 @@ static char* silent_pic_get_name()
     {
         extension = "MLV";
     }
+    else if (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_JPEG)
+    {
+        extension = "JPG";
+    }
     else
     {
         extension = "DNG";
@@ -198,17 +249,48 @@ static char* silent_pic_get_name()
     int file_number = get_shooting_card()->file_number;
     
     int is_mlv = (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_MLV);
+    const char* dcim = get_valid_dcim_dir();
     
+    char pattern[100];
     if (is_intervalometer_running() && !is_mlv)
     {
-        char pattern[100];
-        snprintf(pattern, sizeof(pattern), "%s/%%08d.%s", get_dcim_dir(), 0, extension);
+        snprintf(pattern, sizeof(pattern), "%s/", dcim);
+        int len = strlen(pattern);
+        pattern[len++] = '%';
+        pattern[len++] = '0';
+        pattern[len++] = '8';
+        pattern[len++] = 'd';
+        pattern[len++] = '.';
+        pattern[len] = '\0';
+        strcat(pattern, extension);
         get_numbered_file_name(pattern, 99999999, image_file_name, sizeof(image_file_name));
     }
     else
     {
-        char pattern[100];
-        snprintf(pattern, sizeof(pattern), "%s/%04d%%04d.%s", get_dcim_dir(), file_number, 0, extension);
+        if (file_number > 0)
+        {
+            snprintf(pattern, sizeof(pattern), "%s/%04d", dcim, file_number);
+            int len = strlen(pattern);
+            pattern[len++] = '%';
+            pattern[len++] = '0';
+            pattern[len++] = '4';
+            pattern[len++] = 'd';
+            pattern[len++] = '.';
+            pattern[len] = '\0';
+            strcat(pattern, extension);
+        }
+        else
+        {
+            snprintf(pattern, sizeof(pattern), "%s/", dcim);
+            int len = strlen(pattern);
+            pattern[len++] = '%';
+            pattern[len++] = '0';
+            pattern[len++] = '8';
+            pattern[len++] = 'd';
+            pattern[len++] = '.';
+            pattern[len] = '\0';
+            strcat(pattern, extension);
+        }
         get_numbered_file_name(pattern, 9999, image_file_name, sizeof(image_file_name));
     }
     bmp_printf(FONT_MED, 0, 37, "%s    ", image_file_name);
@@ -579,6 +661,20 @@ static int silent_pic_save_file(struct raw_info * raw_info)
             silent_set_dng_metadata();
             char* filename = silent_pic_get_name();
             return save_lossless_dng(filename, raw_info);
+        }
+
+        case SILENT_PIC_FILE_FORMAT_JPEG:
+        {
+            char* filename = silent_pic_get_name();
+            struct vram_info * vram = get_yuv422_vram();
+            if (!vram || !vram->vram)
+            {
+                bmp_printf(FONT_MED, 0, 83, "VRAM error");
+                return 0;
+            }
+            int ok = encode_yuv422_to_jpeg(vram->vram, vram->width, vram->height, vram->pitch, 85, filename);
+            if (!ok) bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
+            return ok;
         }
     }
 
@@ -967,14 +1063,55 @@ static int silent_pic_raw_prepare_buffers(struct memSuite * mem_suite, int initi
 static int
 silent_pic_take_lv(int interactive)
 {
-    if (lens_info.job_state || !lv)
+    if (silent_pic_file_format != SILENT_PIC_FILE_FORMAT_JPEG)
     {
-        /* only works in LV, and conflicts with regular picture taking */
-        return 0;
+        if (lens_info.job_state || !lv)
+        {
+            /* only works in LV, and conflicts with regular picture taking */
+            return 0;
+        }
     }
 
     bmp_printf(FONT_MED, 0, 37, "Preparing...");
     int ok = 1;
+
+    if (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_JPEG)
+    {
+        /* Zero-allocation, lightweight JPEG capture directly from LiveView VRAM */
+        struct vram_info * vram = get_yuv422_vram();
+        if (!vram || !vram->vram)
+        {
+            printf("[SILENT] get_yuv422_vram returned NULL\n");
+            bmp_printf(FONT_MED, 0, 83, "VRAM error");
+            return 0;
+        }
+        void * buf = vram->vram;
+        int w = vram->width ? vram->width : 720;
+        int h = vram->height ? vram->height : 480;
+        int pitch = vram->pitch ? vram->pitch : 1440;
+
+        silent_capture_lv_metadata();
+        char * filename = silent_pic_get_name();
+        silent_log("silent_pic_take_lv: preparing filename:");
+        silent_log(filename);
+        printf("[SILENT] Saving JPEG %dx%d (pitch %d) to %s (buf=%p)\n", w, h, pitch, filename, buf);
+        bmp_printf(FONT_MED, 0, 60, "Saving JPEG %dx%d...", w, h);
+
+        ok = encode_yuv422_to_jpeg(buf, w, h, pitch, 85, filename);
+        if (ok) silent_log("encode_yuv422_to_jpeg returned SUCCESS (1)");
+        else silent_log("encode_yuv422_to_jpeg returned FAILURE (0)");
+        if (!ok)
+        {
+            bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
+        }
+        else
+        {
+            beep();
+            bmp_printf(FONT_MED, 0, 60, "Saved %s", filename);
+        }
+        redraw();
+        return ok;
+    }
 
     if (silent_pic_mode == SILENT_PIC_MODE_FULLRES_LV)
     {
@@ -1627,9 +1764,16 @@ silent_pic_take(unsigned int interactive) // for remote release, set interactive
         return CBR_RET_STOP;
     }
     
+    silent_log("silent_pic_take entered");
+
     int ok = 0;
 
-    if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
+    if (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_JPEG)
+    {
+        silent_log("silent_pic_take: routing to JPEG LV path");
+        ok = silent_pic_take_lv(interactive);
+    }
+    else if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
     {
         /* in fullres mode, go to LiveView only if in normal photo mode */
         /* if it's in QR or paused LV (most likely from previous silent picture), just stay there */
@@ -1705,7 +1849,7 @@ static unsigned int silent_pic_polling_cbr(unsigned int ctx)
             }
         }
 
-        if (lv && !is_manual_focus())
+        if (silent_pic_file_format != SILENT_PIC_FILE_FORMAT_JPEG && lv && !is_manual_focus())
         {
             /* try to ignore the AF button, and only take pictures on plain half-shutter */
             /* problem: lv_focus_status is not updated right away :( */
@@ -1727,7 +1871,7 @@ static unsigned int silent_pic_polling_cbr(unsigned int ctx)
             }
         }
 
-        if (lv && lens_info.IS)
+        if (silent_pic_file_format != SILENT_PIC_FILE_FORMAT_JPEG && lv && lens_info.IS)
         {
             /* if enabled on the lens, wait until the half-shutter activates it (500ms timeout) */
             /* fixme: with a short half-shutter press, IS may not be activated */
@@ -1764,6 +1908,24 @@ static unsigned int silent_pic_polling_cbr(unsigned int ctx)
     return 0;
 }
 
+static void silent_snap_task(void * priv)
+{
+    silent_log("1: silent_snap_task started");
+    silent_pic_enabled = 1;
+    gui_stop_menu();
+    msleep(500);
+    silent_log("2: menu stopped, calling silent_pic_take_lv");
+    bmp_printf(FONT_MED, 0, 100, "Snap Now executing...");
+    silent_pic_take_lv(1);
+    silent_log("3: silent_snap_task finished");
+}
+
+static void silent_pic_snap_now(void * priv, int delta)
+{
+    silent_log("0: silent_pic_snap_now invoked");
+    task_create("silent_snap", 0x1c, 0x2000, silent_snap_task, 0);
+}
+
 static struct menu_entry silent_menu[] = {
     {
         .name = "Silent Picture",
@@ -1775,6 +1937,11 @@ static struct menu_entry silent_menu[] = {
         #ifdef FEATURE_SILENT_PIC_RAW_BURST
         .submenu_width = 700,
         .children =  (struct menu_entry[]) {
+            {
+                .name = "Snap Now",
+                .select = silent_pic_snap_now,
+                .help = "Capture a silent picture immediately in LiveView.",
+            },
             {
                 .name = "Silent Mode",
                 .priv = &silent_pic_mode,
@@ -1839,13 +2006,14 @@ static struct menu_entry silent_menu[] = {
                 .name = "File Format",
                 .update = silent_pic_file_format_display,
                 .priv = &silent_pic_file_format,
-                .max = 2,
+                .max = 3,
                 .help = "File format to save the image as:",
                 .help2 =
                     "DNG is slow, but needs no extra post-processing.\n"
                     "MLV is fast, and will group all frames into a single video file.\n"
-                    "Lossless DNG is fast and uses CR2 compression routines (experimental).\n",
-                .choices = CHOICES("DNG", "MLV", "Lossless DNG"),
+                    "Lossless DNG is fast and uses CR2 compression routines (experimental).\n"
+                    "JPEG is ultra-lightweight (~300KB) and saves immediately.\n",
+                .choices = CHOICES("DNG", "MLV", "Lossless DNG", "JPEG"),
             },
             MENU_EOL,
         }
@@ -1870,8 +2038,7 @@ static unsigned int silent_init()
 
     if (!lossless_init())
     {
-        /* lossless DNG not available; hide from menu */
-        silent_menu[0].children[3].max = 1;
+        /* lossless DNG not available on DIGIC 4; File Format max remains 3 so JPEG is accessible */
     }
 
     if (!is_camera("5D3",  "*"))

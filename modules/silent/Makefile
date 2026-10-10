@@ -1,6 +1,6 @@
 # define the module name - make sure name is max 8 characters
 MODULE_NAME = silent
-MODULE_OBJS = $(BUILD_DIR)/silent.o $(BUILD_DIR)/lossless.o
+MODULE_OBJS = $(BUILD_DIR)/silent.o $(BUILD_DIR)/lossless.o $(BUILD_DIR)/jpeg_enc.o
 TOP_DIR = ../..
 
 # include modules environment
