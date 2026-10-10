@@ -82,175 +82,36 @@ static const char * gnd_soft_choices[] = {
     "Soft Edge"
 };
 
-static inline uint8_t clamp_u8(int v)
-{
-    if (v < 0) return 0;
-    if (v > 255) return 255;
-    return (uint8_t)v;
-}
+/* Rust Engine FFI Declarations */
+extern void rust_flt_get_crop_bounds(
+    uint32_t ratio,
+    int width,
+    int height,
+    int * ymin,
+    int * ymax,
+    int * xmin,
+    int * xmax
+);
 
-/* Transform a macro-pixel (Y0, Y1, U, V) with active film simulation curve */
-static inline void transform_film(int mode, uint8_t *y0, uint8_t *y1, uint8_t *u, uint8_t *v)
-{
-    switch (mode)
-    {
-        case 1: /* Kodak Portra 400 */
-        {
-            if (*y0 > 165) *y0 = 165 + ((*y0 - 165) * 65) / 100;
-            else if (*y0 < 35) *y0 = 8 + (*y0 * 75) / 100;
-
-            if (*y1 > 165) *y1 = 165 + ((*y1 - 165) * 65) / 100;
-            else if (*y1 < 35) *y1 = 8 + (*y1 * 75) / 100;
-
-            int du = (int)*u - 128;
-            int dv = (int)*v - 128;
-            *u = clamp_u8(128 + (du * 92) / 100);
-            *v = clamp_u8(128 + (dv * 115) / 100 + 4);
-            break;
-        }
-
-        case 2: /* Fuji Velvia 50 */
-        {
-            *y0 = (*y0 < 128) ? (*y0 * *y0) / 140 : 255 - ((255 - *y0) * (255 - *y0)) / 140;
-            *y1 = (*y1 < 128) ? (*y1 * *y1) / 140 : 255 - ((255 - *y1) * (255 - *y1)) / 140;
-
-            int du = (int)*u - 128;
-            int dv = (int)*v - 128;
-            *u = clamp_u8(128 + (du * 140) / 100);
-            *v = clamp_u8(128 + (dv * 140) / 100);
-            break;
-        }
-
-        case 3: /* Cinestill 800T */
-        {
-            int du = ((int)*u - 128) * 110 / 100 + 8;
-            int dv = ((int)*v - 128) * 95 / 100 - 3;
-
-            int y_avg = ((int)*y0 + (int)*y1) >> 1;
-            if (y_avg > 180)
-            {
-                dv += ((y_avg - 180) * 45) / 75;
-            }
-
-            *u = clamp_u8(128 + du);
-            *v = clamp_u8(128 + dv);
-            break;
-        }
-
-        case 4: /* Kodak Tri-X 400 */
-        {
-            *u = 128;
-            *v = 128;
-            *y0 = (*y0 < 128) ? (*y0 * *y0) / 135 : 255 - ((255 - *y0) * (255 - *y0)) / 135;
-            *y1 = (*y1 < 128) ? (*y1 * *y1) / 135 : 255 - ((255 - *y1) * (255 - *y1)) / 135;
-            break;
-        }
-
-        case 5: /* Classic Chrome */
-        {
-            if (*y0 < 110) *y0 = (*y0 * *y0) / 120;
-            if (*y1 < 110) *y1 = (*y1 * *y1) / 120;
-
-            int du = (int)*u - 128;
-            int dv = (int)*v - 128;
-            *u = clamp_u8(128 + (du * 75) / 100);
-            *v = clamp_u8(128 + (dv * 80) / 100);
-            break;
-        }
-
-        default:
-            break;
-    }
-}
-
-/* Apply masking outside the active cinematic crop area */
-static inline void apply_mask(int style, int is_border, uint8_t *y0, uint8_t *y1, uint8_t *u, uint8_t *v)
-{
-    if (style == 2) /* Frame Lines */
-    {
-        if (is_border)
-        {
-            *y0 = 230;
-            *y1 = 230;
-            *u = 128;
-            *v = 128;
-        }
-    }
-    else if (style == 1) /* Solid Cinema Black */
-    {
-        *y0 = 0;
-        *y1 = 0;
-        *u = 128;
-        *v = 128;
-    }
-    else /* Shaded Viewfinder (50% dimmed) */
-    {
-        *y0 = *y0 >> 1;
-        *y1 = *y1 >> 1;
-        *u = 128 + (((int)*u - 128) >> 1);
-        *v = 128 + (((int)*v - 128) >> 1);
-    }
-}
-
-/* Compute vertical and horizontal crop boundaries for chosen aspect ratio */
-static void get_crop_bounds(int ratio, int width, int height, int *ymin, int *ymax, int *xmin, int *xmax)
-{
-    *ymin = 0;
-    *ymax = height;
-    *xmin = 0;
-    *xmax = width;
-
-    switch (ratio)
-    {
-        case 1: /* Hasselblad XPan 65:24 (~2.708:1) */
-        {
-            int h = (width * 24) / 65;
-            if (h > height) h = height;
-            *ymin = (height - h) / 2;
-            *ymax = *ymin + h;
-            break;
-        }
-
-        case 2: /* CinemaScope 2.39:1 */
-        {
-            int h = (width * 100) / 239;
-            if (h > height) h = height;
-            *ymin = (height - h) / 2;
-            *ymax = *ymin + h;
-            break;
-        }
-
-        case 3: /* Univisium 2.00:1 */
-        {
-            int h = width / 2;
-            if (h > height) h = height;
-            *ymin = (height - h) / 2;
-            *ymax = *ymin + h;
-            break;
-        }
-
-        case 4: /* Square 1:1 */
-        {
-            int w = height;
-            if (w > width) w = width;
-            *xmin = (width - w) / 2;
-            *xmax = *xmin + w;
-            break;
-        }
-
-        case 5: /* Classic 4:3 */
-        {
-            int w = (height * 4) / 3;
-            if (w > width) w = width;
-            *xmin = (width - w) / 2;
-            *xmax = *xmin + w;
-            break;
-        }
-
-        default:
-            break;
-    }
-}
+extern void rust_flt_process_row(
+    const uint32_t * row_src,
+    uint32_t * row_dst,
+    int dwords_visible,
+    int y,
+    int ymin,
+    int ymax,
+    int xmin,
+    int xmax,
+    int has_crop,
+    uint32_t mask_style,
+    uint32_t film_preset,
+    int gnd_active,
+    int gnd_shift,
+    int gnd_y_start,
+    int gnd_y_end,
+    int nd_active,
+    int nd_shift
+);
 
 static unsigned int live_flt_display_cbr(unsigned int ctx)
 {
@@ -300,10 +161,10 @@ static unsigned int live_flt_display_cbr(unsigned int ctx)
     }
 
     int ymin, ymax, xmin, xmax;
-    get_crop_bounds(live_flt_cine_ratio, width, height, &ymin, &ymax, &xmin, &xmax);
+    rust_flt_get_crop_bounds(live_flt_cine_ratio, width, height, &ymin, &ymax, &xmin, &xmax);
 
     int has_crop = (live_flt_cine_ratio > 0);
-    int mask_style = live_flt_cine_style;
+    uint32_t mask_style = (uint32_t) live_flt_cine_style;
 
     int gnd_active = (live_flt_film_sim == 6);
     int horizon_y = 0, y_start_trans = 0, y_end_trans = 0, top_shift = 0;
@@ -327,63 +188,25 @@ static unsigned int live_flt_display_cbr(unsigned int ctx)
         uint32_t * row_src = src + y * dwords_per_row;
         uint32_t * row_dst = dst + y * dwords_per_row;
 
-        int row_outside_v = has_crop && (y < ymin || y >= ymax);
-        int row_border_v  = has_crop && (y == ymin || y == ymax - 1);
-
-        for (int x = 0; x < dwords_visible; x++)
-        {
-            uint32_t p = row_src[x];
-            uint8_t u  = p & 0xFF;
-            uint8_t y0 = (p >> 8) & 0xFF;
-            uint8_t v  = (p >> 16) & 0xFF;
-            uint8_t y1 = (p >> 24) & 0xFF;
-
-            int px0 = x * 2;
-            int px1 = px0 + 1;
-
-            int is_outside = row_outside_v || (has_crop && (px1 < xmin || px0 >= xmax));
-            int is_border  = row_border_v  || (has_crop && (px0 == xmin || px1 == xmax - 1));
-
-            if (is_outside)
-            {
-                apply_mask(mask_style, is_border, &y0, &y1, &u, &v);
-            }
-            else
-            {
-                if (gnd_active)
-                {
-                    if (y < y_start_trans)
-                    {
-                        y0 >>= top_shift;
-                        y1 >>= top_shift;
-                    }
-                    else if (y <= y_end_trans)
-                    {
-                        int factor_min = 256 >> top_shift;
-                        int factor = factor_min + ((256 - factor_min) * (y - y_start_trans)) / (y_end_trans - y_start_trans + 1);
-                        if (factor > 256) factor = 256;
-                        y0 = (y0 * factor) >> 8;
-                        y1 = (y1 * factor) >> 8;
-                    }
-                }
-                else if (nd_active)
-                {
-                    y0 >>= nd_shift;
-                    y1 >>= nd_shift;
-                }
-                else if (live_flt_film_sim > 0)
-                {
-                    transform_film(live_flt_film_sim, &y0, &y1, &u, &v);
-                }
-
-                if (mask_style == 2 && is_border)
-                {
-                    y0 = 230; y1 = 230; u = 128; v = 128;
-                }
-            }
-
-            row_dst[x] = (uint32_t)u | ((uint32_t)y0 << 8) | ((uint32_t)v << 16) | ((uint32_t)y1 << 24);
-        }
+        rust_flt_process_row(
+            row_src,
+            row_dst,
+            dwords_visible,
+            y,
+            ymin,
+            ymax,
+            xmin,
+            xmax,
+            has_crop,
+            mask_style,
+            (uint32_t) live_flt_film_sim,
+            gnd_active,
+            top_shift,
+            y_start_trans,
+            y_end_trans,
+            nd_active,
+            nd_shift
+        );
 
         if (dwords_per_row > dwords_visible && row_dst != row_src)
         {
