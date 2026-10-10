@@ -54,7 +54,7 @@ static const char * film_choices[] = {
 
 static unsigned int live_flt_display_cbr(unsigned int ctx)
 {
-    if (!live_flt_mode || !lv || EXT_MONITOR_CONNECTED)
+    if (!live_flt_mode || !lv || ext_monitor_hdmi)
     {
         return 0;
     }
@@ -378,13 +378,13 @@ static struct menu_entry live_flt_menu[] =
 
 static unsigned int live_flt_init()
 {
-    menu_add("Overlay", live_flt_menu, COUNT(live_flt_menu));
+    menu_add("Look", live_flt_menu, COUNT(live_flt_menu));
     return 0;
 }
 
 static unsigned int live_flt_deinit()
 {
-    menu_remove("Overlay", live_flt_menu, COUNT(live_flt_menu));
+    menu_remove("Look", live_flt_menu, COUNT(live_flt_menu));
     return 0;
 }
 

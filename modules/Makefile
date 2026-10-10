@@ -47,9 +47,7 @@ ML_MODULES = \
     bulb_nd \
     live_flt \
     selftest \
-    adv_int \
-    dev_tools/edmac \
-    sd_uhs
+    adv_int
 
 .PHONY: clean $(BUILD_DIR)
 

@@ -22,3 +22,5 @@ Cargo.lock
 *~
 Thumbs.db
 [Dd]esktop.ini
+__pycache__/
+*.pyc

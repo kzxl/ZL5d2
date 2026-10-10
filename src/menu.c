@@ -1312,6 +1312,13 @@ menu_update_placeholder(struct menu * menu, struct menu_entry * new_entry)
 }
 
 
+static const char * canonical_menu_name(const char * name)
+{
+    if (streq(name, "Shoot")) return "Capture";
+    if (streq(name, "Display") || streq(name, "Debug") || streq(name, "Help")) return "Prefs";
+    return name;
+}
+
 static REQUIRES(menu_sem)
 void menu_add_internal(
     const char *        name,
@@ -1327,12 +1334,14 @@ void menu_add_internal(
     if ( count == 0 )
         return;
 
-    // Still photography optimization: filter out unwanted video/audio/games tabs
-    if (streq(name, "Audio") || streq(name, "Movie") || streq(name, "Games") || streq(name, "Movie Tweaks"))
+    // Still photography optimization: filter out unwanted video/audio/games/help tabs
+    if (streq(name, "Audio") || streq(name, "Movie") || streq(name, "Games") || streq(name, "Movie Tweaks") || streq(name, "Help"))
         return;
 
+    const char * target_name = canonical_menu_name(name);
+
     // Walk the menu list to find a menu
-    struct menu * menu = menu_find_by_name_internal( name, 0);
+    struct menu * menu = menu_find_by_name_internal( target_name, 0);
     if( !menu )
         return;
 
@@ -1518,7 +1527,8 @@ void menu_remove(
     if ( count == 0 )
         return;
 
-    struct menu * menu = menu_find_by_name( name, 0);
+    const char * target_name = canonical_menu_name(name);
+    struct menu * menu = menu_find_by_name( target_name, 0);
     if( !menu )
         return;
 
@@ -5515,25 +5525,25 @@ menu_init( void )
     DryosDebugMsg(0, 15, "created gui_sem in menu_init()");
     menu_redraw_sem = create_named_semaphore("menu_r", SEM_CREATE_UNLOCKED);
 
-    // Optimized tab order for still photography (no Audio, Movie, Games)
+    // ZeroLantern 5D2 Still Photography Menu Tabs
     menu_find_by_name( "Expo",      ICON_ML_EXPO    );
-    menu_find_by_name( "Shoot",     ICON_ML_SHOOT   );
+    menu_find_by_name( "Look",      ICON_ML_DISPLAY );
     menu_find_by_name( "Focus",     ICON_ML_FOCUS   );
+    menu_find_by_name( "Capture",   ICON_ML_SHOOT   );
     menu_find_by_name( "Overlay",   ICON_ML_OVERLAY );
-    menu_find_by_name( "Display",   ICON_ML_DISPLAY );
     menu_find_by_name( "Prefs",     ICON_ML_PREFS   );
     menu_find_by_name( "Modules",   ICON_ML_MODULES );
-    menu_find_by_name( "Debug",     ICON_ML_DEBUG   );
-    menu_find_by_name( "Help",      ICON_ML_INFO    );
 
     struct menu *m = menu_find_by_name( "Modules", 0 );
-    ASSERT(m);
-    m->split_pos = -11;
-    m->no_name_lookup = 1;
+    if (m) {
+        m->split_pos = -11;
+        m->no_name_lookup = 1;
+    }
 
     m = menu_find_by_name( "Help", 0 );
-    ASSERT(m);
-    m->no_name_lookup = 1;
+    if (m) {
+        m->no_name_lookup = 1;
+    }
 }
 
 /*

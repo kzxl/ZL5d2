@@ -851,7 +851,7 @@ static struct lvinfo_item info_item = {
 
 static void picstyle_features_init()
 {
-    menu_add("Expo", picstyle_features_menu, COUNT(picstyle_features_menu));
+    menu_add("Look", picstyle_features_menu, COUNT(picstyle_features_menu));
     lvinfo_add_item(&info_item);
 }
 

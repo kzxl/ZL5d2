@@ -2766,155 +2766,6 @@ struct menu_entry zebra_menus[] = {
         },
     },
     #endif
-
-    #ifdef FEATURE_FOCUS_PEAK_DISP_FILTER
-        #ifndef FEATURE_FOCUS_PEAK
-        #error This requires FEATURE_FOCUS_PEAK.
-        #endif
-    #endif
-
-    #ifdef FEATURE_FOCUS_PEAK
-    {
-        .name = "Focus Peak",
-        .priv           = &focus_peaking,
-        .update         = focus_peaking_display,
-        .max = 1,
-        .help = "Show which parts of the image are in focus.",
-        .submenu_width = 650,
-        .depends_on = DEP_GLOBAL_DRAW,
-        .children =  (struct menu_entry[]) {
-            {
-                .name = "Filter bias", 
-                .priv = &focus_peaking_filter_edges,
-                .max = 2,
-                .choices = (const char *[]) {"Strong edges", "Balanced", "Fine details"},
-                .help  = "Fine-tune the focus detection algorithm:",
-                .help2 = "Strong edges: looks for edges, works best in low light.\n"
-                         "Balanced: tries to cover both strong edges and fine details.\n"
-                         "Fine details: looks for microcontrast. Needs lots of light.\n",
-                .icon_type = IT_DICE
-            },
-            /*
-            {
-                .name = "Method",
-                .priv = &focus_peaking_method, 
-                .max = 1,
-                .choices = (const char *[]) {"1st deriv.", "2nd deriv.", "Nyquist H"},
-                .help = "Contrast detection method. 2: more accurate, 1: less noisy.",
-            },*/
-            #ifdef FEATURE_FOCUS_PEAK_DISP_FILTER
-                #ifndef CONFIG_DISPLAY_FILTERS
-                #error This requires CONFIG_DISPLAY_FILTERS.
-                #endif
-            {
-                .name = "Display type",
-                .priv = &focus_peaking_disp, 
-                .max = 4,
-                .choices = (const char *[]) {"Blinking dots", "Fine dots", "Alpha blend", "Sharpness", "Raw"},
-                .help = "How to display peaking. Alpha looks nicer, but image lags.",
-            },
-            #endif
-            {
-                .name = "Threshold", 
-                .priv = &focus_peaking_pthr,
-                .select = focus_peaking_adjust_thr,
-                .max    = 50,
-                .icon_type = IT_PERCENT_LOG,
-                .unit = UNIT_PERCENT_x10,
-                .help = "How many pixels are considered in focus (percentage).",
-            },
-            {
-                .name = "Color", 
-                .priv = &focus_peaking_color,
-                .max = 7,
-                .choices = (const char *[]) {"Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "Global Focus", "Local Focus"},
-                .help = "Focus peaking color (fixed or color coding).",
-                .icon_type = IT_DICE,
-            },
-            {
-                .name = "Grayscale image", 
-                .priv = &focus_peaking_grayscale,
-                .max = 1,
-                .help = "Display LiveView image in grayscale.",
-            },
-            MENU_EOL
-        },
-    },
-    #endif
-    #ifdef FEATURE_MAGIC_ZOOM
-    {
-        .name = "Magic Zoom",
-        .priv = &zoom_overlay_enabled,
-        .update = zoom_overlay_display,
-        .min = 0,
-        .max = 1,
-        .help = "Zoom box for checking focus. Can be used while recording.",
-        .submenu_width = 650,
-        .depends_on = DEP_GLOBAL_DRAW | DEP_LIVEVIEW,
-        .children =  (struct menu_entry[]) {
-            {
-                .name = "Trigger mode",
-                .priv = &zoom_overlay_trigger_mode, 
-                .min = 1,
-                .max = 4,
-                #ifdef CONFIG_ZOOM_BTN_NOT_WORKING_WHILE_RECORDING
-                .choices = (const char *[]) {"HalfShutter", "Focus Ring", "FocusR+HalfS", "Always On"},
-                .help = "Trigger Magic Zoom by focus ring or half-shutter.",
-                #else
-                .choices = (const char *[]) {"Zoom.REC", "Focus+ZREC", "ZoomIn (+)", "Always On"},
-                .help = "Zoom when recording / trigger from focus ring / Zoom button",
-                #endif
-            },
-            {
-                .name = "Size", 
-                .priv = &zoom_overlay_size,
-                #ifdef FEATURE_MAGIC_ZOOM_FULL_SCREEN // most new cameras can do fullscreen :)
-                .max = 3,
-                .help = "Size of zoom box (small / medium / large / full screen).",
-                #else // old cameras - simple zoom box
-                .max = 2,
-                .help = "Size of zoom box (small / medium / large).",
-                #endif
-                .choices = (const char *[]) {"Small", "Medium", "Large", "FullScreen"},
-                .icon_type = IT_SIZE,
-            },
-            {
-                .name = "Position", 
-                .priv = &zoom_overlay_pos,
-                .max = 4,
-                .choices = (const char *[]) {"Focus box", "Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"},
-                .icon_type = IT_DICE,
-                .help = "Position of zoom box (fixed or linked to focus box).",
-            },
-            {
-                .name = "Magnification", 
-                .priv = &zoom_overlay_x,
-                .max = 2,
-                .choices = (const char *[]) {"1:1", "2:1", "3:1", "4:1"},
-                .icon_type = IT_SIZE,
-                .help = "1:1 displays recorded pixels, 2:1 displays them doubled.",
-            },
-            #ifdef CONFIG_LV_FOCUS_INFO
-            {
-                .name = "Focus confirm", 
-                .priv = &zoom_overlay_split,
-                .max = 2,
-                .choices = (const char *[]) {"Green Bars", "SplitScreen", "SS ZeroCross"},
-                .icon_type = IT_DICE,
-                .help = "How to show focus confirmation (green bars / split screen).",
-            },
-            #endif
-            /*{
-                .name = "Look-up Table", 
-                .priv = &zoom_overlay_lut,
-                .max = 1,
-                .choices = (const char *[]) {"OFF", "CineStyle"},
-                .help = "LUT for increasing contrast in the zoom box.",
-            },*/
-            MENU_EOL
-        },
-    },
-    #endif
     #ifdef FEATURE_CROPMARKS
     MENU_PLACEHOLDER("Cropmarks"),
     #endif
@@ -3098,6 +2949,135 @@ struct menu_entry zebra_menus[] = {
     },
     #endif
 };
+
+#if defined(FEATURE_FOCUS_PEAK) || defined(FEATURE_MAGIC_ZOOM)
+static struct menu_entry focus_assist_menus[] = {
+    #ifdef FEATURE_FOCUS_PEAK
+    {
+        .name = "Focus Peak",
+        .priv           = &focus_peaking,
+        .update         = focus_peaking_display,
+        .max = 1,
+        .help = "Show which parts of the image are in focus.",
+        .submenu_width = 650,
+        .depends_on = DEP_GLOBAL_DRAW,
+        .children =  (struct menu_entry[]) {
+            {
+                .name = "Filter bias", 
+                .priv = &focus_peaking_filter_edges,
+                .max = 2,
+                .choices = (const char *[]) {"Strong edges", "Balanced", "Fine details"},
+                .help  = "Fine-tune the focus detection algorithm:",
+                .help2 = "Strong edges: looks for edges, works best in low light.\n"
+                         "Balanced: tries to cover both strong edges and fine details.\n"
+                         "Fine details: looks for microcontrast. Needs lots of light.\n",
+                .icon_type = IT_DICE
+            },
+            #ifdef FEATURE_FOCUS_PEAK_DISP_FILTER
+            {
+                .name = "Display type",
+                .priv = &focus_peaking_disp, 
+                .max = 4,
+                .choices = (const char *[]) {"Blinking dots", "Fine dots", "Alpha blend", "Sharpness", "Raw"},
+                .help = "How to display peaking. Alpha looks nicer, but image lags.",
+            },
+            #endif
+            {
+                .name = "Threshold", 
+                .priv = &focus_peaking_pthr,
+                .select = focus_peaking_adjust_thr,
+                .max    = 50,
+                .icon_type = IT_PERCENT_LOG,
+                .unit = UNIT_PERCENT_x10,
+                .help = "How many pixels are considered in focus (percentage).",
+            },
+            {
+                .name = "Color", 
+                .priv = &focus_peaking_color,
+                .max = 7,
+                .choices = (const char *[]) {"Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "Global Focus", "Local Focus"},
+                .help = "Focus peaking color (fixed or color coding).",
+                .icon_type = IT_DICE,
+            },
+            {
+                .name = "Grayscale image", 
+                .priv = &focus_peaking_grayscale,
+                .max = 1,
+                .help = "Display LiveView image in grayscale.",
+            },
+            MENU_EOL
+        },
+    },
+    #endif
+    #ifdef FEATURE_MAGIC_ZOOM
+    {
+        .name = "Magic Zoom",
+        .priv = &zoom_overlay_enabled,
+        .update = zoom_overlay_display,
+        .min = 0,
+        .max = 1,
+        .help = "Zoom box for checking focus. Can be used while recording.",
+        .submenu_width = 650,
+        .depends_on = DEP_GLOBAL_DRAW | DEP_LIVEVIEW,
+        .children =  (struct menu_entry[]) {
+            {
+                .name = "Trigger mode",
+                .priv = &zoom_overlay_trigger_mode, 
+                .min = 1,
+                .max = 4,
+                #ifdef CONFIG_ZOOM_BTN_NOT_WORKING_WHILE_RECORDING
+                .choices = (const char *[]) {"HalfShutter", "Focus Ring", "FocusR+HalfS", "Always On"},
+                .help = "Trigger Magic Zoom by focus ring or half-shutter.",
+                #else
+                .choices = (const char *[]) {"Zoom.REC", "Focus+ZREC", "ZoomIn (+)", "Always On"},
+                .help = "Zoom when recording / trigger from focus ring / Zoom button",
+                #endif
+            },
+            {
+                .name = "Size", 
+                .priv = &zoom_overlay_size,
+                #ifdef FEATURE_MAGIC_ZOOM_FULL_SCREEN // most new cameras can do fullscreen :)
+                .max = 3,
+                .help = "Size of zoom box (small / medium / large / full screen).",
+                #else // old cameras - simple zoom box
+                .max = 2,
+                .help = "Size of zoom box (small / medium / large).",
+                #endif
+                .choices = (const char *[]) {"Small", "Medium", "Large", "FullScreen"},
+                .icon_type = IT_SIZE,
+            },
+            {
+                .name = "Position", 
+                .priv = &zoom_overlay_pos,
+                .max = 4,
+                .choices = (const char *[]) {"Focus box", "Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"},
+                .icon_type = IT_DICE,
+                .help = "Position of zoom box (fixed or linked to focus box).",
+            },
+            {
+                .name = "Magnification", 
+                .priv = &zoom_overlay_x,
+                .max = 2,
+                .choices = (const char *[]) {"1:1", "2:1", "3:1", "4:1"},
+                .icon_type = IT_SIZE,
+                .help = "1:1 displays recorded pixels, 2:1 displays them doubled.",
+            },
+            #ifdef CONFIG_LV_FOCUS_INFO
+            {
+                .name = "Focus confirm", 
+                .priv = &zoom_overlay_split,
+                .max = 2,
+                .choices = (const char *[]) {"Green Bars", "SplitScreen", "SS ZeroCross"},
+                .icon_type = IT_DICE,
+                .help = "How to show focus confirmation (green bars / split screen).",
+            },
+            #endif
+            MENU_EOL
+        },
+    },
+    #endif
+};
+#endif
 
 static struct menu_entry livev_dbg_menus[] = {
     #ifdef FEATURE_SHOW_OVERLAY_FPS
@@ -4531,6 +4511,9 @@ static void zebra_init()
 {
     precompute_yuv2rgb();
     menu_add( "Overlay", zebra_menus, COUNT(zebra_menus) );
+#if defined(FEATURE_FOCUS_PEAK) || defined(FEATURE_MAGIC_ZOOM)
+    menu_add( "Focus", focus_assist_menus, COUNT(focus_assist_menus) );
+#endif
     menu_add( "Debug", livev_dbg_menus, COUNT(livev_dbg_menus) );
     //~ menu_add( "Movie", movie_menus, COUNT(movie_menus) );
     //~ menu_add( "Config", cfg_menus, COUNT(cfg_menus) );
