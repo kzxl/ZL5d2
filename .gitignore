@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+*.o
+*.d
+*.bin
+*.fir
+*.FIR
+*.mo
+*.sym
+*.SYM
+*.a
+*.tmp
+
+# Rust artifacts
+target/
+Cargo.lock
+
+# Editor & OS files
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+[Dd]esktop.ini
