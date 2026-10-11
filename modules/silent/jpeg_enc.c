@@ -1,5 +1,5 @@
 /**
- * Ultra-lightweight, Zero-Allocation YUV422 (UYVY) to Baseline JPEG Encoder
+ * Ultra-lightweight, Zero-Allocation YUV422 (UYVY) & Raw Full-Res Baseline JPEG Encoder
  * Designed specifically for DIGIC 4 (Canon EOS 5D Mark II).
  *
  * Guarantees:
@@ -7,11 +7,14 @@
  * - ZERO stack overflow risk (all working matrices and buffers in static BSS).
  * - Direct streaming I/O in 4KB chunks via FIO_WriteFile.
  * - Integer-only AAN / LLM 2D Forward DCT.
+ * - Streaming 8-line strip debayer & film simulation pipeline (< 100 KB RAM).
  */
 
 #include <dryos.h>
 #include <stdint.h>
 #include <string.h>
+#include <bmp.h>
+#include <raw.h>
 #include "jpeg_enc.h"
 
 // Standard JPEG Quantization Tables (50% quality base)
@@ -113,6 +116,44 @@ static int16_t y1_block[64];
 static int16_t u_block[64];
 static int16_t v_block[64];
 static int16_t q_block[64];
+
+// Strip buffer for Full-Res debayering: 8 lines x 5632 pixels x 2 bytes = 90,112 bytes
+#define STRIP_MAX_WIDTH 5632
+#define STRIP_LINES 8
+static uint8_t strip_buf[STRIP_MAX_WIDTH * STRIP_LINES * 2] __attribute__((aligned(4)));
+
+// Fast Gamma / White Balance LUTs for Raw Debayering (3 KB in BSS)
+static uint8_t lut_r[1024];
+static uint8_t lut_g[1024];
+static uint8_t lut_b[1024];
+
+#ifndef PA
+#define PA ((int)(p->a))
+#define PB ((int)(p->b_lo | (p->b_hi << 12)))
+#define PC ((int)(p->c_lo | (p->c_hi << 10)))
+#define PD ((int)(p->d_lo | (p->d_hi << 8)))
+#define PE ((int)(p->e_lo | (p->e_hi << 6)))
+#define PF ((int)(p->f_lo | (p->f_hi << 4)))
+#define PG ((int)(p->g_lo | (p->g_hi << 2)))
+#define PH ((int)(p->h))
+#endif
+
+#ifndef QA
+#define QA ((int)(q->a))
+#define QB ((int)(q->b_lo | (q->b_hi << 12)))
+#define QC ((int)(q->c_lo | (q->c_hi << 10)))
+#define QD ((int)(q->d_lo | (q->d_hi << 8)))
+#define QE ((int)(q->e_lo | (q->e_hi << 6)))
+#define QF ((int)(q->f_lo | (q->f_hi << 4)))
+#define QG ((int)(q->g_lo | (q->g_hi << 2)))
+#define QH ((int)(q->h))
+#endif
+
+static inline uint8_t clamp_u8(int32_t val) {
+    if (val < 0) return 0;
+    if (val > 255) return 255;
+    return (uint8_t)val;
+}
 
 static void flush_out_buf() {
     if (out_buf_pos > 0 && out_file) {
@@ -312,33 +353,269 @@ static void encode_block(int16_t* block, int16_t* prev_dc, const huff_code_t* dc
     }
 }
 
-int encode_yuv422_to_jpeg(const uint8_t* uyvy_data, int width, int height, int pitch, int quality, const char* out_path) {
-    if (!uyvy_data || width <= 0 || height <= 0 || !out_path) {
-        printf("[JPEG_ENC] Invalid args: uyvy=%p w=%d h=%d path=%s\n", uyvy_data, width, height, out_path ? out_path : "NULL");
-        return 0;
+static inline void apply_film_stock(uint32_t preset, uint8_t* py0, uint8_t* py1, uint8_t* pu, uint8_t* pv)
+{
+    int32_t y0 = *py0;
+    int32_t y1 = *py1;
+    int32_t u  = *pu;
+    int32_t v  = *pv;
+
+    switch (preset)
+    {
+        case 1: // Kodak Portra 400: Soft highlights, lifted shadows, warm skin tones
+            y0 = clamp_u8(16 + ((y0 * 240) >> 8));
+            y1 = clamp_u8(16 + ((y1 * 240) >> 8));
+            u  = clamp_u8(128 + (((u - 128) * 235) >> 8));
+            v  = clamp_u8(128 + (((v - 128) * 287) >> 8));
+            break;
+
+        case 2: // Fuji Velvia 50: Vivid high-contrast S-curve, punchy greens and blues
+            y0 = (y0 < 128) ? clamp_u8((y0 * y0) >> 7) : clamp_u8(255 - (((255 - y0) * (255 - y0)) >> 7));
+            y1 = (y1 < 128) ? clamp_u8((y1 * y1) >> 7) : clamp_u8(255 - (((255 - y1) * (255 - y1)) >> 7));
+            u  = clamp_u8(128 + (((u - 128) * 358) >> 8));
+            v  = clamp_u8(128 + (((v - 128) * 346) >> 8));
+            break;
+
+        case 3: // Cinestill 800T: Tungsten cool shadows, warm red halation
+            u  = clamp_u8(128 + (((u - 128) * 320) >> 8));
+            v  = clamp_u8(128 + (((v - 128) * 230) >> 8));
+            if (y0 > 185) v = clamp_u8(v + ((y0 - 185) >> 2));
+            if (y1 > 185) v = clamp_u8(v + ((y1 - 185) >> 2));
+            break;
+
+        case 4: // Kodak Tri-X 400: Punchy high-contrast monochrome
+            y0 = (y0 < 128) ? clamp_u8((y0 * 220) >> 8) : clamp_u8(110 + (((y0 - 128) * 290) >> 8));
+            y1 = (y1 < 128) ? clamp_u8((y1 * 220) >> 8) : clamp_u8(110 + (((y1 - 128) * 290) >> 8));
+            u  = 128;
+            v  = 128;
+            break;
+
+        case 5: // Classic Chrome: Muted documentary colors, hard shadow gradations
+            if (y0 < 64) y0 = clamp_u8((y0 * 220) >> 8);
+            if (y1 < 64) y1 = clamp_u8((y1 * 220) >> 8);
+            u  = clamp_u8(128 + (((u - 128) * 192) >> 8));
+            v  = clamp_u8(128 + (((v - 128) * 192) >> 8));
+            break;
+
+        default:
+            break;
     }
 
-    out_file = FIO_CreateFile(out_path);
-    if (!out_file) {
-        FILE* lf = FIO_CreateFileOrAppend("A:/silent.log");
-        if (lf) {
-            FIO_WriteFile(lf, "FIO_CreateFile FAILED: ", 23);
-            FIO_WriteFile(lf, out_path, strlen(out_path));
-            FIO_WriteFile(lf, "\n", 1);
-            FIO_CloseFile(lf);
-        }
-        return 0;
-    }
-    else {
-        FILE* lf = FIO_CreateFileOrAppend("A:/silent.log");
-        if (lf) {
-            FIO_WriteFile(lf, "FIO_CreateFile SUCCESS: ", 24);
-            FIO_WriteFile(lf, out_path, strlen(out_path));
-            FIO_WriteFile(lf, "\n", 1);
-            FIO_CloseFile(lf);
-        }
-    }
+    *py0 = (uint8_t)y0;
+    *py1 = (uint8_t)y1;
+    *pu  = (uint8_t)u;
+    *pv  = (uint8_t)v;
+}
 
+void apply_film_simulation_yuv422(uint8_t* uyvy_data, int width, int height, int pitch, int film_preset)
+{
+    if (!uyvy_data || film_preset <= 0 || film_preset > 5) return;
+
+    for (int y = 0; y < height; y++)
+    {
+        uint32_t* row = (uint32_t*)(uyvy_data + y * pitch);
+        int pairs = width / 2;
+        for (int i = 0; i < pairs; i++)
+        {
+            uint32_t val = row[i];
+            uint8_t u  = (uint8_t)(val & 0xFF);
+            uint8_t y0 = (uint8_t)((val >> 8) & 0xFF);
+            uint8_t v  = (uint8_t)((val >> 16) & 0xFF);
+            uint8_t y1 = (uint8_t)((val >> 24) & 0xFF);
+
+            apply_film_stock((uint32_t)film_preset, &y0, &y1, &u, &v);
+
+            row[i] = (uint32_t)u | ((uint32_t)y0 << 8) | ((uint32_t)v << 16) | ((uint32_t)y1 << 24);
+        }
+    }
+}
+
+static void init_raw_gamma_luts(int black, int white)
+{
+    int range = white - black;
+    if (range < 2000) range = 14000;
+
+    for (int i = 0; i < 1024; i++)
+    {
+        int raw_val = (i << 4);
+        if (raw_val > range) raw_val = range;
+
+        int norm = (raw_val * 1024) / range;
+        uint32_t val = (uint32_t)(norm * 64);
+        uint32_t root = 0;
+        uint32_t bit = 1 << 14;
+        while (bit > 0)
+        {
+            if (val >= root + bit)
+            {
+                val -= root + bit;
+                root = (root >> 1) + bit;
+            }
+            else
+            {
+                root >>= 1;
+            }
+            bit >>= 2;
+        }
+        if (root > 255) root = 255;
+
+        // Daylight white balance gains (Canon 5D2): R ~ 2.05x, G = 1.0x, B ~ 1.55x
+        int r_val = (root * 525) >> 8;
+        int g_val = (int)root;
+        int b_val = (root * 397) >> 8;
+
+        lut_r[i] = (r_val > 255) ? 255 : (uint8_t)r_val;
+        lut_g[i] = (g_val > 255) ? 255 : (uint8_t)g_val;
+        lut_b[i] = (b_val > 255) ? 255 : (uint8_t)b_val;
+    }
+}
+
+static void debayer_raw_8lines(
+    const struct raw_info* raw,
+    int start_y,
+    uint8_t* strip,
+    int width,
+    int strip_pitch
+)
+{
+    int raw_y0 = raw->jpeg.y + start_y;
+    int raw_x0 = raw->jpeg.x;
+    int raw_pitch = raw->pitch;
+    uint8_t* raw_buf = (uint8_t*)raw->buffer;
+    int black = (raw->black_level > 0) ? raw->black_level : 1024;
+
+    for (int pair = 0; pair < 4; pair++)
+    {
+        int line_even = pair * 2;
+        int line_odd  = line_even + 1;
+
+        int ry_even = raw_y0 + line_even;
+        int ry_odd  = raw_y0 + line_odd;
+
+        if (ry_even >= raw->height) ry_even = (raw->height - 2) & ~1;
+        if (ry_odd  >= raw->height) ry_odd  = raw->height - 1;
+        if (ry_even < 0) ry_even = 0;
+        if (ry_odd  < 0) ry_odd  = 1;
+
+        struct raw_pixblock* row_p = (struct raw_pixblock*)(raw_buf + ry_even * raw_pitch + (raw_x0 / 8) * 14);
+        struct raw_pixblock* row_q = (struct raw_pixblock*)(raw_buf + ry_odd  * raw_pitch + (raw_x0 / 8) * 14);
+
+        uint8_t* out_even = strip + line_even * strip_pitch;
+        uint8_t* out_odd  = strip + line_odd  * strip_pitch;
+
+        for (int col = 0; col < width; col += 8)
+        {
+            int pb_idx = col / 8;
+            struct raw_pixblock* p = &row_p[pb_idx];
+            struct raw_pixblock* q = &row_q[pb_idx];
+
+            int p_pix[8] = { PA, PB, PC, PD, PE, PF, PG, PH };
+            int q_pix[8] = { QA, QB, QC, QD, QE, QF, QG, QH };
+
+            for (int k = 0; k < 4; k++)
+            {
+                int raw_r  = p_pix[k * 2];
+                int raw_ga = p_pix[k * 2 + 1];
+                int raw_gb = q_pix[k * 2];
+                int raw_b  = q_pix[k * 2 + 1];
+
+                int ir  = (raw_r  - black) > 0 ? (((raw_r  - black) >> 4) < 1024 ? ((raw_r  - black) >> 4) : 1023) : 0;
+                int iga = (raw_ga - black) > 0 ? (((raw_ga - black) >> 4) < 1024 ? ((raw_ga - black) >> 4) : 1023) : 0;
+                int igb = (raw_gb - black) > 0 ? (((raw_gb - black) >> 4) < 1024 ? ((raw_gb - black) >> 4) : 1023) : 0;
+                int ib  = (raw_b  - black) > 0 ? (((raw_b  - black) >> 4) < 1024 ? ((raw_b  - black) >> 4) : 1023) : 0;
+
+                int r = lut_r[ir];
+                int b = lut_b[ib];
+                int g_even = lut_g[(iga + igb) >> 1];
+                int g_odd  = g_even;
+
+                int y0_even = (77 * r + 150 * lut_g[iga] + 29 * b) >> 8;
+                int y1_even = (77 * r + 150 * g_even + 29 * b) >> 8;
+                int u_even  = 128 + ((-43 * r - 85 * g_even + 128 * b) >> 8);
+                int v_even  = 128 + ((128 * r - 107 * g_even - 21 * b) >> 8);
+
+                int y0_odd  = (77 * r + 150 * lut_g[igb] + 29 * b) >> 8;
+                int y1_odd  = (77 * r + 150 * g_odd + 29 * b) >> 8;
+                int u_odd   = u_even;
+                int v_odd   = v_even;
+
+                int out_x = (col + k * 2) * 2;
+                if (out_x + 3 < strip_pitch)
+                {
+                    out_even[out_x + 0] = clamp_u8(u_even);
+                    out_even[out_x + 1] = clamp_u8(y0_even);
+                    out_even[out_x + 2] = clamp_u8(v_even);
+                    out_even[out_x + 3] = clamp_u8(y1_even);
+
+                    out_odd[out_x + 0]  = clamp_u8(u_odd);
+                    out_odd[out_x + 1]  = clamp_u8(y0_odd);
+                    out_odd[out_x + 2]  = clamp_u8(v_odd);
+                    out_odd[out_x + 3]  = clamp_u8(y1_odd);
+                }
+            }
+        }
+    }
+}
+
+static void encode_mcu_row(
+    const uint8_t* mcu_row_uyvy,
+    int width,
+    int pitch,
+    int valid_lines,
+    int16_t* p_prev_dc_y,
+    int16_t* p_prev_dc_u,
+    int16_t* p_prev_dc_v
+)
+{
+    int mcu_w = 16;
+    int mcus_x = (width + mcu_w - 1) / mcu_w;
+
+    for (int mx = 0; mx < mcus_x; mx++) {
+        int px0 = mx * mcu_w;
+
+        for (int r = 0; r < 8; r++) {
+            int r_idx = (r < valid_lines) ? r : (valid_lines - 1);
+            const uint8_t* row = mcu_row_uyvy + r_idx * pitch;
+
+            for (int c = 0; c < 8; c++) {
+                int x0 = px0 + c;
+                if (x0 >= width) x0 = width - 1;
+                int pair_idx0 = (x0 >> 1) * 4;
+                y0_block[r * 8 + c] = ((x0 & 1) ? row[pair_idx0 + 3] : row[pair_idx0 + 1]) - 128;
+
+                int x1 = px0 + 8 + c;
+                if (x1 >= width) x1 = width - 1;
+                int pair_idx1 = (x1 >> 1) * 4;
+                y1_block[r * 8 + c] = ((x1 & 1) ? row[pair_idx1 + 3] : row[pair_idx1 + 1]) - 128;
+
+                int xu = px0 + (c * 2);
+                if (xu >= width) xu = width - 2;
+                int pair_u = (xu >> 1) * 4;
+                u_block[r * 8 + c] = row[pair_u + 0] - 128;
+                v_block[r * 8 + c] = row[pair_u + 2] - 128;
+            }
+        }
+
+        // Encode Y0 (8x8)
+        fdct_2d(y0_block, q_block, qtab_y);
+        encode_block(q_block, p_prev_dc_y, huff_dc_lum, huff_ac_lum);
+
+        // Encode Y1 (8x8)
+        fdct_2d(y1_block, q_block, qtab_y);
+        encode_block(q_block, p_prev_dc_y, huff_dc_lum, huff_ac_lum);
+
+        // Encode Cb/U (8x8)
+        fdct_2d(u_block, q_block, qtab_c);
+        encode_block(q_block, p_prev_dc_u, huff_dc_chrom, huff_ac_chrom);
+
+        // Encode Cr/V (8x8)
+        fdct_2d(v_block, q_block, qtab_c);
+        encode_block(q_block, p_prev_dc_v, huff_dc_chrom, huff_ac_chrom);
+    }
+}
+
+static void write_jpeg_headers(int width, int height, int quality)
+{
     init_tables(quality);
     out_buf_pos = 0;
     bit_buffer = 0;
@@ -372,119 +649,136 @@ int encode_yuv422_to_jpeg(const uint8_t* uyvy_data, int width, int height, int p
     write_byte((height >> 8) & 0xFF); write_byte(height & 0xFF);
     write_byte((width >> 8) & 0xFF); write_byte(width & 0xFF);
     write_byte(0x03);                   // 3 components (Y, Cb, Cr)
-    // Component 1: Y (H=2, V=1) -> 4:2:2 sampling!
-    write_byte(0x01); write_byte(0x21); write_byte(0x00);
-    // Component 2: Cb (H=1, V=1)
-    write_byte(0x02); write_byte(0x11); write_byte(0x01);
-    // Component 3: Cr (H=1, V=1)
-    write_byte(0x03); write_byte(0x11); write_byte(0x01);
+    write_byte(0x01); write_byte(0x21); write_byte(0x00); // Y  (H=2, V=1)
+    write_byte(0x02); write_byte(0x11); write_byte(0x01); // Cb (H=1, V=1)
+    write_byte(0x03); write_byte(0x11); write_byte(0x01); // Cr (H=1, V=1)
 
     // 5. DHT (Huffman Tables)
-    // DC Lum
     write_byte(0xFF); write_byte(0xC4);
     write_byte(0x00); write_byte(3 + sizeof(dc_lum_bits) + sizeof(dc_lum_val));
-    write_byte(0x00); // DC 0
+    write_byte(0x00);
     for (int i = 0; i < 16; i++) write_byte(dc_lum_bits[i]);
     for (size_t i = 0; i < sizeof(dc_lum_val); i++) write_byte(dc_lum_val[i]);
 
-    // DC Chrom
     write_byte(0xFF); write_byte(0xC4);
     write_byte(0x00); write_byte(3 + sizeof(dc_chrom_bits) + sizeof(dc_chrom_val));
-    write_byte(0x01); // DC 1
+    write_byte(0x01);
     for (int i = 0; i < 16; i++) write_byte(dc_chrom_bits[i]);
     for (size_t i = 0; i < sizeof(dc_chrom_val); i++) write_byte(dc_chrom_val[i]);
 
-    // AC Lum
     write_byte(0xFF); write_byte(0xC4);
     write_byte(0x00); write_byte(3 + sizeof(ac_lum_bits) + sizeof(ac_lum_val));
-    write_byte(0x10); // AC 0
+    write_byte(0x10);
     for (int i = 0; i < 16; i++) write_byte(ac_lum_bits[i]);
     for (size_t i = 0; i < sizeof(ac_lum_val); i++) write_byte(ac_lum_val[i]);
 
-    // AC Chrom
     write_byte(0xFF); write_byte(0xC4);
     write_byte(0x00); write_byte(3 + sizeof(ac_chrom_bits) + sizeof(ac_chrom_val));
-    write_byte(0x11); // AC 1
+    write_byte(0x11);
     for (int i = 0; i < 16; i++) write_byte(ac_chrom_bits[i]);
     for (size_t i = 0; i < sizeof(ac_chrom_val); i++) write_byte(ac_chrom_val[i]);
 
     // 6. SOS (Start of Scan)
     write_byte(0xFF); write_byte(0xDA);
-    write_byte(0x00); write_byte(12);  // Length = 12
-    write_byte(0x03);                   // 3 components
-    write_byte(0x01); write_byte(0x00); // Y: DC 0, AC 0
-    write_byte(0x02); write_byte(0x11); // Cb: DC 1, AC 1
-    write_byte(0x03); write_byte(0x11); // Cr: DC 1, AC 1
-    write_byte(0x00); write_byte(0x3F); write_byte(0x00); // Spectral selection
+    write_byte(0x00); write_byte(12);
+    write_byte(0x03);
+    write_byte(0x01); write_byte(0x00);
+    write_byte(0x02); write_byte(0x11);
+    write_byte(0x03); write_byte(0x11);
+    write_byte(0x00); write_byte(0x3F); write_byte(0x00);
+}
 
-    // 7. Encode MCUs (16x8 pixels per MCU in 4:2:2)
+static void write_jpeg_trailer(void)
+{
+    flush_bits();
+    write_byte(0xFF); write_byte(0xD9); // EOI
+    flush_out_buf();
+    if (out_file) {
+        FIO_CloseFile(out_file);
+        out_file = NULL;
+    }
+}
+
+int encode_yuv422_to_jpeg(const uint8_t* uyvy_data, int width, int height, int pitch, int quality, const char* out_path) {
+    if (!uyvy_data || width <= 0 || height <= 0 || !out_path) {
+        printf("[JPEG_ENC] Invalid args: uyvy=%p w=%d h=%d path=%s\n", uyvy_data, width, height, out_path ? out_path : "NULL");
+        return 0;
+    }
+
+    out_file = FIO_CreateFile(out_path);
+    if (!out_file) {
+        return 0;
+    }
+
+    write_jpeg_headers(width, height, quality);
+
     int16_t prev_dc_y = 0;
     int16_t prev_dc_u = 0;
     int16_t prev_dc_v = 0;
 
-    int mcu_w = 16;
     int mcu_h = 8;
-    int mcus_x = (width + mcu_w - 1) / mcu_w;
     int mcus_y = (height + mcu_h - 1) / mcu_h;
 
     for (int my = 0; my < mcus_y; my++) {
         int py0 = my * mcu_h;
-        for (int mx = 0; mx < mcus_x; mx++) {
-            int px0 = mx * mcu_w;
+        int remaining = height - py0;
+        int valid_lines = (remaining >= 8) ? 8 : remaining;
 
-            // Extract MCU pixels from UYVY buffer:
-            for (int r = 0; r < 8; r++) {
-                int y_coord = py0 + r;
-                if (y_coord >= height) y_coord = height - 1;
-                const uint8_t* row = uyvy_data + y_coord * pitch;
+        const uint8_t* row_ptr = uyvy_data + py0 * pitch;
+        encode_mcu_row(row_ptr, width, pitch, valid_lines, &prev_dc_y, &prev_dc_u, &prev_dc_v);
+    }
 
-                for (int c = 0; c < 8; c++) {
-                    // Left 8 pixels (Y0)
-                    int x0 = px0 + c;
-                    if (x0 >= width) x0 = width - 1;
-                    int pair_idx0 = (x0 >> 1) * 4;
-                    y0_block[r * 8 + c] = ((x0 & 1) ? row[pair_idx0 + 3] : row[pair_idx0 + 1]) - 128;
+    write_jpeg_trailer();
+    return 1;
+}
 
-                    // Right 8 pixels (Y1)
-                    int x1 = px0 + 8 + c;
-                    if (x1 >= width) x1 = width - 1;
-                    int pair_idx1 = (x1 >> 1) * 4;
-                    y1_block[r * 8 + c] = ((x1 & 1) ? row[pair_idx1 + 3] : row[pair_idx1 + 1]) - 128;
+int encode_raw_fullres_to_jpeg(const struct raw_info* raw, int quality, int film_preset, const char* out_path)
+{
+    if (!raw || !raw->buffer || !out_path) {
+        printf("[JPEG_FULLRES] Invalid args: raw=%p path=%s\n", raw, out_path ? out_path : "NULL");
+        return 0;
+    }
 
-                    // Subsampled U and V (8 samples for 16 horizontal pixels)
-                    int xu = px0 + (c * 2);
-                    if (xu >= width) xu = width - 2;
-                    int pair_u = (xu >> 1) * 4;
-                    u_block[r * 8 + c] = row[pair_u + 0] - 128; // U
-                    v_block[r * 8 + c] = row[pair_u + 2] - 128; // V
-                }
-            }
+    int width = raw->jpeg.width;
+    int height = raw->jpeg.height;
 
-            // Encode Y0 (8x8)
-            fdct_2d(y0_block, q_block, qtab_y);
-            encode_block(q_block, &prev_dc_y, huff_dc_lum, huff_ac_lum);
+    if (width <= 0) width = raw->width & ~15;
+    if (height <= 0) height = raw->height & ~7;
+    if (width > STRIP_MAX_WIDTH) width = STRIP_MAX_WIDTH;
 
-            // Encode Y1 (8x8)
-            fdct_2d(y1_block, q_block, qtab_y);
-            encode_block(q_block, &prev_dc_y, huff_dc_lum, huff_ac_lum);
+    out_file = FIO_CreateFile(out_path);
+    if (!out_file) {
+        printf("[JPEG_FULLRES] Failed to create output file: %s\n", out_path);
+        return 0;
+    }
 
-            // Encode Cb/U (8x8)
-            fdct_2d(u_block, q_block, qtab_c);
-            encode_block(q_block, &prev_dc_u, huff_dc_chrom, huff_ac_chrom);
+    init_raw_gamma_luts(raw->black_level, raw->white_level);
+    write_jpeg_headers(width, height, quality);
 
-            // Encode Cr/V (8x8)
-            fdct_2d(v_block, q_block, qtab_c);
-            encode_block(q_block, &prev_dc_v, huff_dc_chrom, huff_ac_chrom);
+    int16_t prev_dc_y = 0;
+    int16_t prev_dc_u = 0;
+    int16_t prev_dc_v = 0;
+
+    int mcu_h = 8;
+    int mcus_y = (height + mcu_h - 1) / mcu_h;
+    int strip_pitch = width * 2;
+
+    for (int my = 0; my < mcus_y; my++) {
+        int py0 = my * mcu_h;
+        debayer_raw_8lines(raw, py0, strip_buf, width, strip_pitch);
+
+        if (film_preset > 0 && film_preset <= 5) {
+            apply_film_simulation_yuv422(strip_buf, width, 8, strip_pitch, film_preset);
+        }
+
+        encode_mcu_row(strip_buf, width, strip_pitch, 8, &prev_dc_y, &prev_dc_u, &prev_dc_v);
+
+        if ((my & 63) == 0 && mcus_y > 0) {
+            bmp_printf(FONT_MED, 0, 83, "JPEG: %d%% (%d/%d)", (my * 100) / mcus_y, my, mcus_y);
         }
     }
 
-    flush_bits();
-
-    // 8. EOI (End of Image)
-    write_byte(0xFF); write_byte(0xD9);
-    flush_out_buf();
-
-    FIO_CloseFile(out_file);
-    out_file = NULL;
+    write_jpeg_trailer();
+    bmp_printf(FONT_MED, 0, 83, "Saved Full-Res JPEG %dx%d", width, height);
     return 1;
 }

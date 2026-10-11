@@ -49,6 +49,53 @@ static CONFIG_INT( "silent.pic.mode", silent_pic_mode, 0 );
 static CONFIG_INT( "silent.pic.slitscan.mode", silent_pic_slitscan_mode, 0 );
 static CONFIG_INT( "silent.pic.fullres.trigger", silent_pic_fullres_trigger_mode, 0 );
 static CONFIG_INT( "silent.pic.file_format", silent_pic_file_format, 0 );
+static CONFIG_INT( "silent.pic.film_sim", silent_pic_film_sim, 0 );
+
+static const char* film_sim_labels[] = {
+    "Auto (Look)", "Off", "Portra 400", "Velvia 50", "Cinestill 800T", "Tri-X 400", "Classic Chrome"
+};
+
+static int get_active_film_preset(void)
+{
+    if (silent_pic_film_sim == 0) /* Auto: inherit from Look tab / live_flt */
+    {
+        struct config_var * var = module_get_config_var("live_flt.film_sim");
+        if (var && var->value)
+        {
+            int val = *(var->value);
+            if (val >= 1 && val <= 5) return val;
+        }
+        return 0;
+    }
+    else if (silent_pic_film_sim >= 2 && silent_pic_film_sim <= 6)
+    {
+        return silent_pic_film_sim - 1; /* 2 -> 1 (Portra), 3 -> 2 (Velvia), ... */
+    }
+    return 0; /* 1: Off */
+}
+
+static MENU_UPDATE_FUNC(silent_pic_film_sim_display)
+{
+    if (silent_pic_film_sim == 0)
+    {
+        int inherited = 0;
+        struct config_var * var = module_get_config_var("live_flt.film_sim");
+        if (var && var->value) inherited = *(var->value);
+        if (inherited >= 1 && inherited <= 5)
+        {
+            MENU_SET_VALUE("Auto (%s)", film_sim_labels[inherited + 1]);
+        }
+        else
+        {
+            MENU_SET_VALUE("Auto (Off)");
+        }
+    }
+    else
+    {
+        MENU_SET_VALUE("%s", film_sim_labels[COERCE(silent_pic_film_sim, 0, 6)]);
+    }
+}
+
 #define SILENT_PIC_MODE_SIMPLE 0
 #define SILENT_PIC_MODE_BURST 1
 #define SILENT_PIC_MODE_BURST_END_TRIGGER 2
@@ -666,15 +713,31 @@ static int silent_pic_save_file(struct raw_info * raw_info)
         case SILENT_PIC_FILE_FORMAT_JPEG:
         {
             char* filename = silent_pic_get_name();
-            struct vram_info * vram = get_yuv422_vram();
-            if (!vram || !vram->vram)
+            int film_sim = get_active_film_preset();
+
+            if (raw_info && raw_info->buffer && raw_info->jpeg.width > 1920)
             {
-                bmp_printf(FONT_MED, 0, 83, "VRAM error");
-                return 0;
+                bmp_printf(FONT_MED, 0, 60, "Encoding Full-Res JPEG %dx%d...", raw_info->jpeg.width, raw_info->jpeg.height);
+                int ok = encode_raw_fullres_to_jpeg(raw_info, 85, film_sim, filename);
+                if (!ok) bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
+                return ok;
             }
-            int ok = encode_yuv422_to_jpeg(vram->vram, vram->width, vram->height, vram->pitch, 85, filename);
-            if (!ok) bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
-            return ok;
+            else
+            {
+                struct vram_info * vram = get_yuv422_vram();
+                if (!vram || !vram->vram)
+                {
+                    bmp_printf(FONT_MED, 0, 83, "VRAM error");
+                    return 0;
+                }
+                if (film_sim > 0)
+                {
+                    apply_film_simulation_yuv422(vram->vram, vram->width, vram->height, vram->pitch, film_sim);
+                }
+                int ok = encode_yuv422_to_jpeg(vram->vram, vram->width, vram->height, vram->pitch, 85, filename);
+                if (!ok) bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
+                return ok;
+            }
         }
     }
 
@@ -1096,6 +1159,12 @@ silent_pic_take_lv(int interactive)
         silent_log(filename);
         printf("[SILENT] Saving JPEG %dx%d (pitch %d) to %s (buf=%p)\n", w, h, pitch, filename, buf);
         bmp_printf(FONT_MED, 0, 60, "Saving JPEG %dx%d...", w, h);
+
+        int film_sim = get_active_film_preset();
+        if (film_sim > 0)
+        {
+            apply_film_simulation_yuv422((uint8_t*)buf, w, h, pitch, film_sim);
+        }
 
         ok = encode_yuv422_to_jpeg(buf, w, h, pitch, 85, filename);
         if (ok) silent_log("encode_yuv422_to_jpeg returned SUCCESS (1)");
@@ -1768,21 +1837,18 @@ silent_pic_take(unsigned int interactive) // for remote release, set interactive
 
     int ok = 0;
 
-    if (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_JPEG)
-    {
-        silent_log("silent_pic_take: routing to JPEG LV path");
-        ok = silent_pic_take_lv(interactive);
-    }
-    else if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
+    if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
     {
         /* in fullres mode, go to LiveView only if in normal photo mode */
         /* if it's in QR or paused LV (most likely from previous silent picture), just stay there */
         if (!lv && !LV_PAUSED && gui_state != GUISTATE_QR) force_liveview();
+        silent_log("silent_pic_take: routing to fullres path");
         ok = silent_pic_take_fullres(interactive);
     }
     else
     {
-        if (!lv) force_liveview();
+        if (!lv && silent_pic_file_format != SILENT_PIC_FILE_FORMAT_JPEG) force_liveview();
+        silent_log("silent_pic_take: routing to LV path");
         ok = silent_pic_take_lv(interactive);
     }
 
@@ -1914,9 +1980,16 @@ static void silent_snap_task(void * priv)
     silent_pic_enabled = 1;
     gui_stop_menu();
     msleep(500);
-    silent_log("2: menu stopped, calling silent_pic_take_lv");
+    silent_log("2: menu stopped, calling capture");
     bmp_printf(FONT_MED, 0, 100, "Snap Now executing...");
-    silent_pic_take_lv(1);
+    if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
+    {
+        silent_pic_take_fullres(1);
+    }
+    else
+    {
+        silent_pic_take_lv(1);
+    }
     silent_log("3: silent_snap_task finished");
 }
 
@@ -2012,8 +2085,18 @@ static struct menu_entry silent_menu[] = {
                     "DNG is slow, but needs no extra post-processing.\n"
                     "MLV is fast, and will group all frames into a single video file.\n"
                     "Lossless DNG is fast and uses CR2 compression routines (experimental).\n"
-                    "JPEG is ultra-lightweight (~300KB) and saves immediately.\n",
+                    "JPEG is ultra-lightweight and saves immediately.\n",
                 .choices = CHOICES("DNG", "MLV", "Lossless DNG", "JPEG"),
+            },
+            {
+                .name = "Film Sim (JPEG)",
+                .update = silent_pic_film_sim_display,
+                .priv = &silent_pic_film_sim,
+                .max = 6,
+                .choices = CHOICES("Auto (Look)", "Off", "Portra 400", "Velvia 50", "Cinestill 800T", "Tri-X 400", "Classic Chrome"),
+                .help = "Film stock emulation applied to JPEG silent captures.",
+                .help2 = "Applies real-time film color science to LiveView and Full-Res JPEGs.\n"
+                         "Auto: matches active preset selected in the ML Look tab.",
             },
             MENU_EOL,
         }
@@ -2075,6 +2158,7 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(silent_pic_slitscan_mode)
     MODULE_CONFIG(silent_pic_fullres_trigger_mode)
     MODULE_CONFIG(silent_pic_file_format)
+    MODULE_CONFIG(silent_pic_film_sim)
 MODULE_CONFIGS_END()
 
 MODULE_PROPHANDLERS_START()
