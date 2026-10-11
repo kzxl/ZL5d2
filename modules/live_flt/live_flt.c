@@ -40,6 +40,7 @@
 #include <bmp.h>
 #include <vram.h>
 #include <string.h>
+#include <beep.h>
 
 /* Configuration parameters */
 static CONFIG_INT("live_flt.film_sim",   live_flt_film_sim, 0);     /* 0: Off, 1: Portra, 2: Velvia, 3: Cinestill, 4: Tri-X, 5: Classic Chrome, 6: GND, 7: ND */
@@ -51,6 +52,16 @@ static CONFIG_INT("live_flt.gnd_soft",   live_flt_gnd_soft, 1);    /* 0: Hard, 1
 static CONFIG_INT("live_flt.nd_ev",      live_flt_nd_ev, 3);        /* 1 to 6 stops */
 static CONFIG_INT("live_flt.osd_badge",  live_flt_osd_badge, 1);    /* Show OSD badge */
 
+/* Custom Film Recipe configuration */
+static CONFIG_INT("live_flt.recipe_preset", live_flt_recipe_preset, 0); /* 0: Off, 1: Portra Warm, 2: Fuji Superia, 3: Kodachrome 64, 4: Tri-X Push 2, 5: Custom */
+static CONFIG_INT("live_flt.rec_base",       live_flt_rec_base, 0);     /* 0: Portra, 1: Velvia, 2: Cinestill, 3: Tri-X, 4: Classic Chrome */
+static CONFIG_INT("live_flt.rec_high",       live_flt_rec_high, 0);     /* -2 .. +2 */
+static CONFIG_INT("live_flt.rec_shadow",     live_flt_rec_shadow, 0);   /* -2 .. +2 */
+static CONFIG_INT("live_flt.rec_sat",        live_flt_rec_sat, 0);      /* -2 .. +2 */
+static CONFIG_INT("live_flt.rec_wb_ab",      live_flt_rec_wb_ab, 0);    /* -9 .. +9 */
+static CONFIG_INT("live_flt.rec_wb_gm",      live_flt_rec_wb_gm, 0);    /* -9 .. +9 */
+static CONFIG_INT("live_flt.rec_grain",      live_flt_rec_grain, 0);    /* 0..3 */
+
 static const char * film_sim_choices[] = {
     "OFF",
     "Kodak Portra 400",
@@ -60,6 +71,30 @@ static const char * film_sim_choices[] = {
     "Classic Chrome",
     "Live GND",
     "Live ND Sim"
+};
+
+static const char * recipe_preset_choices[] = {
+    "OFF",
+    "Portra Warm",
+    "Fuji Superia",
+    "Kodachrome 64",
+    "Tri-X Push 2",
+    "Custom Recipe"
+};
+
+static const char * recipe_base_choices[] = {
+    "Kodak Portra 400",
+    "Fuji Velvia 50",
+    "Cinestill 800T",
+    "Kodak Tri-X 400",
+    "Classic Chrome"
+};
+
+static const char * grain_choices[] = {
+    "Off",
+    "Subtle",
+    "Medium",
+    "Heavy"
 };
 
 static const char * cine_ratio_choices[] = {
@@ -110,12 +145,164 @@ extern void rust_flt_process_row(
     int gnd_y_start,
     int gnd_y_end,
     int nd_active,
-    int nd_shift
+    int nd_shift,
+    int recipe_active,
+    int rec_highlight,
+    int rec_shadow,
+    int rec_saturation,
+    int rec_wb_ab,
+    int rec_wb_gm
 );
+
+static void get_effective_recipe_params(
+    int * base, int * high, int * shadow, int * sat, int * wb_ab, int * wb_gm, int * grain, const char ** name
+)
+{
+    switch (live_flt_recipe_preset)
+    {
+        case 1: // Portra Warm
+            *base = 1; // Portra 400
+            *high = -1;
+            *shadow = 1;
+            *sat = 0;
+            *wb_ab = 3;
+            *wb_gm = 1;
+            *grain = 1;
+            if (name) *name = "Portra Warm";
+            break;
+
+        case 2: // Fuji Superia
+            *base = 2; // Velvia 50
+            *high = 0;
+            *shadow = -1;
+            *sat = -1;
+            *wb_ab = -2;
+            *wb_gm = 2;
+            *grain = 2;
+            if (name) *name = "Fuji Superia";
+            break;
+
+        case 3: // Kodachrome 64
+            *base = 5; // Classic Chrome
+            *high = 1;
+            *shadow = 1;
+            *sat = 1;
+            *wb_ab = 4;
+            *wb_gm = -2;
+            *grain = 2;
+            if (name) *name = "Kodachrome 64";
+            break;
+
+        case 4: // Tri-X Push 2
+            *base = 4; // Kodak Tri-X 400
+            *high = 2;
+            *shadow = -2;
+            *sat = 0;
+            *wb_ab = 0;
+            *wb_gm = 0;
+            *grain = 3;
+            if (name) *name = "Tri-X Push 2";
+            break;
+
+        case 5: // Custom
+            *base = live_flt_rec_base + 1; // 0..4 mapped to 1..5
+            *high = live_flt_rec_high;
+            *shadow = live_flt_rec_shadow;
+            *sat = live_flt_rec_sat;
+            *wb_ab = live_flt_rec_wb_ab;
+            *wb_gm = live_flt_rec_wb_gm;
+            *grain = live_flt_rec_grain;
+            if (name) *name = "Custom Recipe";
+            break;
+
+        default:
+            *base = 0;
+            *high = 0;
+            *shadow = 0;
+            *sat = 0;
+            *wb_ab = 0;
+            *wb_gm = 0;
+            *grain = 0;
+            if (name) *name = "Standard Look";
+            break;
+    }
+}
+
+static void recipe_save_custom(void * priv, int delta)
+{
+    FIO_CreateDirectory("A:/ML/RECIPES");
+    FILE * f = FIO_CreateFile("A:/ML/RECIPES/CUSTOM.REC");
+    if (!f) {
+        bmp_printf(FONT_MED, 0, 60, "Failed to save recipe");
+        return;
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+        "BASE=%d\n"
+        "HIGH=%d\n"
+        "SHADOW=%d\n"
+        "SAT=%d\n"
+        "WB_AB=%d\n"
+        "WB_GM=%d\n"
+        "GRAIN=%d\n",
+        live_flt_rec_base,
+        live_flt_rec_high,
+        live_flt_rec_shadow,
+        live_flt_rec_sat,
+        live_flt_rec_wb_ab,
+        live_flt_rec_wb_gm,
+        live_flt_rec_grain
+    );
+    FIO_WriteFile(f, buf, strlen(buf));
+    FIO_CloseFile(f);
+    beep();
+    bmp_printf(FONT_MED, 0, 60, "Saved to CUSTOM.REC");
+}
+
+static void recipe_load_custom(void * priv, int delta)
+{
+    FILE * f = FIO_OpenFile("A:/ML/RECIPES/CUSTOM.REC", O_RDONLY | O_SYNC);
+    if (!f) {
+        bmp_printf(FONT_MED, 0, 60, "CUSTOM.REC not found");
+        return;
+    }
+    char buf[256];
+    int size = FIO_ReadFile(f, buf, sizeof(buf) - 1);
+    FIO_CloseFile(f);
+    if (size <= 0) return;
+    buf[size] = '\0';
+
+    char * line = buf;
+    while (line && *line)
+    {
+        char * next = strchr(line, '\n');
+        if (next) *next = '\0';
+
+        if (strncmp(line, "BASE=", 5) == 0) live_flt_rec_base = atoi(line + 5);
+        else if (strncmp(line, "HIGH=", 5) == 0) live_flt_rec_high = atoi(line + 5);
+        else if (strncmp(line, "SHADOW=", 7) == 0) live_flt_rec_shadow = atoi(line + 7);
+        else if (strncmp(line, "SAT=", 4) == 0) live_flt_rec_sat = atoi(line + 4);
+        else if (strncmp(line, "WB_AB=", 6) == 0) live_flt_rec_wb_ab = atoi(line + 6);
+        else if (strncmp(line, "WB_GM=", 6) == 0) live_flt_rec_wb_gm = atoi(line + 6);
+        else if (strncmp(line, "GRAIN=", 6) == 0) live_flt_rec_grain = atoi(line + 6);
+
+        line = next ? next + 1 : NULL;
+    }
+    live_flt_rec_base = COERCE(live_flt_rec_base, 0, 4);
+    live_flt_rec_high = COERCE(live_flt_rec_high, -2, 2);
+    live_flt_rec_shadow = COERCE(live_flt_rec_shadow, -2, 2);
+    live_flt_rec_sat = COERCE(live_flt_rec_sat, -2, 2);
+    live_flt_rec_wb_ab = COERCE(live_flt_rec_wb_ab, -9, 9);
+    live_flt_rec_wb_gm = COERCE(live_flt_rec_wb_gm, -9, 9);
+    live_flt_rec_grain = COERCE(live_flt_rec_grain, 0, 3);
+    live_flt_recipe_preset = 5; // Custom
+    beep();
+    bmp_printf(FONT_MED, 0, 60, "Loaded CUSTOM.REC");
+}
 
 static unsigned int live_flt_display_cbr(unsigned int ctx)
 {
-    if ((!live_flt_film_sim && !live_flt_cine_ratio) || !lv)
+    if ((!live_flt_film_sim && !live_flt_cine_ratio && !live_flt_recipe_preset) || !lv)
     {
         return 0;
     }
@@ -183,6 +370,13 @@ static unsigned int live_flt_display_cbr(unsigned int ctx)
     int nd_active = (live_flt_film_sim == 7);
     int nd_shift = COERCE(live_flt_nd_ev, 1, 6);
 
+    int rec_active = (live_flt_recipe_preset > 0);
+    int rec_base = 0, rec_h = 0, rec_s = 0, rec_sat = 0, rec_ab = 0, rec_gm = 0, rec_grain = 0;
+    if (rec_active)
+    {
+        get_effective_recipe_params(&rec_base, &rec_h, &rec_s, &rec_sat, &rec_ab, &rec_gm, &rec_grain, NULL);
+    }
+
     for (int y = 0; y < height; y++)
     {
         uint32_t * row_src = src + y * dwords_per_row;
@@ -199,13 +393,19 @@ static unsigned int live_flt_display_cbr(unsigned int ctx)
             xmax,
             has_crop,
             mask_style,
-            (uint32_t) live_flt_film_sim,
+            rec_active ? (uint32_t)rec_base : (uint32_t)live_flt_film_sim,
             gnd_active,
             top_shift,
             y_start_trans,
             y_end_trans,
             nd_active,
-            nd_shift
+            nd_shift,
+            rec_active,
+            rec_h,
+            rec_s,
+            rec_sat,
+            rec_ab,
+            rec_gm
         );
 
         if (dwords_per_row > dwords_visible && row_dst != row_src)
@@ -234,6 +434,18 @@ static MENU_UPDATE_FUNC(live_flt_film_update)
     else
     {
         MENU_SET_VALUE("%s", film_sim_choices[live_flt_film_sim]);
+    }
+}
+
+static MENU_UPDATE_FUNC(live_flt_recipe_update)
+{
+    if (!live_flt_recipe_preset)
+    {
+        MENU_SET_VALUE("OFF");
+    }
+    else
+    {
+        MENU_SET_VALUE("%s", recipe_preset_choices[COERCE(live_flt_recipe_preset, 0, 5)]);
     }
 }
 
@@ -295,6 +507,85 @@ static struct menu_entry live_flt_menu[] =
                 .min = 1,
                 .max = 6,
                 .help = "Simulated Neutral Density reduction (stops).",
+            },
+            MENU_EOL
+        },
+    },
+    {
+        .name = "Film Recipes",
+        .priv = &live_flt_recipe_preset,
+        .update = live_flt_recipe_update,
+        .max = 5,
+        .choices = recipe_preset_choices,
+        .help = "Fujifilm-style custom film recipes (tone curves, WB shift, grain).",
+        .depends_on = DEP_LIVEVIEW,
+        .children = (struct menu_entry[])
+        {
+            {
+                .name = "Preset",
+                .priv = &live_flt_recipe_preset,
+                .max = 5,
+                .choices = recipe_preset_choices,
+                .help = "Select film recipe preset or Custom.",
+            },
+            {
+                .name = "Base Stock",
+                .priv = &live_flt_rec_base,
+                .max = 4,
+                .choices = recipe_base_choices,
+                .help = "Base emulation stock for Custom recipe.",
+            },
+            {
+                .name = "Highlight Tone",
+                .priv = &live_flt_rec_high,
+                .min = -2,
+                .max = 2,
+                .help = "Highlight rolloff (-2 soft to +2 hard).",
+            },
+            {
+                .name = "Shadow Tone",
+                .priv = &live_flt_rec_shadow,
+                .min = -2,
+                .max = 2,
+                .help = "Shadow level (-2 crushed to +2 lifted).",
+            },
+            {
+                .name = "Color / Sat",
+                .priv = &live_flt_rec_sat,
+                .min = -2,
+                .max = 2,
+                .help = "Color saturation (-2 muted to +2 punchy).",
+            },
+            {
+                .name = "WB Shift A/B",
+                .priv = &live_flt_rec_wb_ab,
+                .min = -9,
+                .max = 9,
+                .help = "White balance Amber (+)/Blue (-) bias.",
+            },
+            {
+                .name = "WB Shift G/M",
+                .priv = &live_flt_rec_wb_gm,
+                .min = -9,
+                .max = 9,
+                .help = "White balance Green (+)/Magenta (-) bias.",
+            },
+            {
+                .name = "Film Grain",
+                .priv = &live_flt_rec_grain,
+                .max = 3,
+                .choices = grain_choices,
+                .help = "LFSR Analog grain level.",
+            },
+            {
+                .name = "Save to CUSTOM.REC",
+                .select = recipe_save_custom,
+                .help = "Export recipe parameters to A:/ML/RECIPES/CUSTOM.REC.",
+            },
+            {
+                .name = "Load from CUSTOM.REC",
+                .select = recipe_load_custom,
+                .help = "Import recipe parameters from A:/ML/RECIPES/CUSTOM.REC.",
             },
             MENU_EOL
         },
@@ -364,4 +655,12 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(live_flt_gnd_soft)
     MODULE_CONFIG(live_flt_nd_ev)
     MODULE_CONFIG(live_flt_osd_badge)
+    MODULE_CONFIG(live_flt_recipe_preset)
+    MODULE_CONFIG(live_flt_rec_base)
+    MODULE_CONFIG(live_flt_rec_high)
+    MODULE_CONFIG(live_flt_rec_shadow)
+    MODULE_CONFIG(live_flt_rec_sat)
+    MODULE_CONFIG(live_flt_rec_wb_ab)
+    MODULE_CONFIG(live_flt_rec_wb_gm)
+    MODULE_CONFIG(live_flt_rec_grain)
 MODULE_CONFIGS_END()

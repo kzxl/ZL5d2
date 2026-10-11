@@ -88,7 +88,115 @@ static int get_jpeg_quality(void)
     }
 }
 
-static void fill_jpeg_exif(struct jpeg_exif_tags * exif, int film_preset)
+static void get_effective_film_recipe(struct film_recipe * r)
+{
+    memset(r, 0, sizeof(*r));
+
+    if (silent_pic_film_sim == 0) /* Auto: inherit from Look tab / live_flt */
+    {
+        /* Check if a Film Recipe is active in live_flt */
+        struct config_var * v_rec = module_get_config_var("live_flt.recipe_preset");
+        int preset = (v_rec && v_rec->value) ? *(v_rec->value) : 0;
+
+        if (preset > 0 && preset <= 4)
+        {
+            r->active = 1;
+            switch (preset)
+            {
+                case 1:
+                    r->base_stock = 1; r->highlight = -1; r->shadow = 1;
+                    r->saturation = 0; r->wb_ab = 3; r->wb_gm = 1; r->grain = 1;
+                    r->name = "Portra Warm";
+                    break;
+                case 2:
+                    r->base_stock = 2; r->highlight = 0; r->shadow = -1;
+                    r->saturation = -1; r->wb_ab = -2; r->wb_gm = 2; r->grain = 2;
+                    r->name = "Fuji Superia";
+                    break;
+                case 3:
+                    r->base_stock = 5; r->highlight = 1; r->shadow = 1;
+                    r->saturation = 1; r->wb_ab = 4; r->wb_gm = -2; r->grain = 2;
+                    r->name = "Kodachrome 64";
+                    break;
+                case 4:
+                    r->base_stock = 4; r->highlight = 2; r->shadow = -2;
+                    r->saturation = 0; r->wb_ab = 0; r->wb_gm = 0; r->grain = 3;
+                    r->name = "Tri-X Push 2";
+                    break;
+            }
+            return;
+        }
+        else if (preset == 5) /* Custom Recipe */
+        {
+            r->active = 1;
+            r->name = "Custom Recipe";
+            struct config_var * v_base = module_get_config_var("live_flt.rec_base");
+            struct config_var * v_h    = module_get_config_var("live_flt.rec_high");
+            struct config_var * v_s    = module_get_config_var("live_flt.rec_shadow");
+            struct config_var * v_sat  = module_get_config_var("live_flt.rec_sat");
+            struct config_var * v_ab   = module_get_config_var("live_flt.rec_wb_ab");
+            struct config_var * v_gm   = module_get_config_var("live_flt.rec_wb_gm");
+            struct config_var * v_gr   = module_get_config_var("live_flt.rec_grain");
+
+            r->base_stock = (v_base && v_base->value) ? *(v_base->value) + 1 : 1;
+            r->highlight  = (v_h && v_h->value) ? *(v_h->value) : 0;
+            r->shadow     = (v_s && v_s->value) ? *(v_s->value) : 0;
+            r->saturation = (v_sat && v_sat->value) ? *(v_sat->value) : 0;
+            r->wb_ab      = (v_ab && v_ab->value) ? *(v_ab->value) : 0;
+            r->wb_gm      = (v_gm && v_gm->value) ? *(v_gm->value) : 0;
+            r->grain      = (v_gr && v_gr->value) ? *(v_gr->value) : silent_pic_grain;
+            return;
+        }
+
+        /* If no recipe active, check simple film simulation */
+        int film_sim = get_active_film_preset();
+        if (film_sim > 0 || silent_pic_grain > 0)
+        {
+            r->active = 1;
+            r->base_stock = film_sim;
+            r->grain = silent_pic_grain;
+            switch (film_sim)
+            {
+                case 1: r->name = "Kodak Portra 400"; break;
+                case 2: r->name = "Fuji Velvia 50"; break;
+                case 3: r->name = "Cinestill 800T"; break;
+                case 4: r->name = "Kodak Tri-X 400"; break;
+                case 5: r->name = "Classic Chrome"; break;
+                default: r->name = "Standard Look"; break;
+            }
+            return;
+        }
+    }
+    else if (silent_pic_film_sim == 1) /* Off */
+    {
+        if (silent_pic_grain > 0)
+        {
+            r->active = 1;
+            r->base_stock = 0;
+            r->grain = silent_pic_grain;
+            r->name = "Standard Look";
+        }
+        return;
+    }
+    else
+    {
+        int preset = silent_pic_film_sim - 1;
+        r->active = 1;
+        r->base_stock = preset;
+        r->grain = silent_pic_grain;
+        switch (preset)
+        {
+            case 1: r->name = "Kodak Portra 400"; break;
+            case 2: r->name = "Fuji Velvia 50"; break;
+            case 3: r->name = "Cinestill 800T"; break;
+            case 4: r->name = "Kodak Tri-X 400"; break;
+            case 5: r->name = "Classic Chrome"; break;
+            default: r->name = "Standard Look"; break;
+        }
+    }
+}
+
+static void fill_jpeg_exif(struct jpeg_exif_tags * exif, const struct film_recipe * recipe)
 {
     memset(exif, 0, sizeof(*exif));
     exif->model = "Canon EOS 5D Mark II";
@@ -96,7 +204,8 @@ static void fill_jpeg_exif(struct jpeg_exif_tags * exif, int film_preset)
     exif->iso = lens_info.iso ? lens_info.iso : 100;
     exif->aperture_x10 = lens_info.aperture ? lens_info.aperture : 28;
     exif->focal_len = lens_info.focal_len ? lens_info.focal_len : 50;
-    exif->grain_strength = silent_pic_grain;
+    exif->grain_strength = recipe ? recipe->grain : silent_pic_grain;
+    exif->film_name = (recipe && recipe->name) ? recipe->name : "Standard Look";
 
     if (lens_info.shutter > 0)
     {
@@ -117,16 +226,6 @@ static void fill_jpeg_exif(struct jpeg_exif_tags * exif, int film_preset)
         exif->shutter_den = 50;
     }
 
-    switch (film_preset)
-    {
-        case 1: exif->film_name = "Kodak Portra 400"; break;
-        case 2: exif->film_name = "Fuji Velvia 50"; break;
-        case 3: exif->film_name = "Cinestill 800T"; break;
-        case 4: exif->film_name = "Kodak Tri-X 400"; break;
-        case 5: exif->film_name = "Classic Chrome"; break;
-        default: exif->film_name = "Standard Look"; break;
-    }
-
     struct tm now;
     LoadCalendarFromRTC(&now);
     exif->year  = now.tm_year + 1900;
@@ -141,12 +240,11 @@ static MENU_UPDATE_FUNC(silent_pic_film_sim_display)
 {
     if (silent_pic_film_sim == 0)
     {
-        int inherited = 0;
-        struct config_var * var = module_get_config_var("live_flt.film_sim");
-        if (var && var->value) inherited = *(var->value);
-        if (inherited >= 1 && inherited <= 5)
+        struct film_recipe r;
+        get_effective_film_recipe(&r);
+        if (r.active && r.name)
         {
-            MENU_SET_VALUE("Auto (%s)", film_sim_labels[inherited + 1]);
+            MENU_SET_VALUE("Auto (%s)", r.name);
         }
         else
         {
@@ -776,15 +874,16 @@ static int silent_pic_save_file(struct raw_info * raw_info)
         case SILENT_PIC_FILE_FORMAT_JPEG:
         {
             char* filename = silent_pic_get_name();
-            int film_sim = get_active_film_preset();
+            struct film_recipe recipe;
+            get_effective_film_recipe(&recipe);
             int quality = get_jpeg_quality();
             struct jpeg_exif_tags exif;
-            fill_jpeg_exif(&exif, film_sim);
+            fill_jpeg_exif(&exif, &recipe);
 
             if (raw_info && raw_info->buffer && raw_info->jpeg.width > 1920)
             {
                 bmp_printf(FONT_MED, 0, 60, "Encoding Full-Res JPEG %dx%d (Q%d)...", raw_info->jpeg.width, raw_info->jpeg.height, quality);
-                int ok = encode_raw_fullres_to_jpeg(raw_info, quality, film_sim, &exif, filename);
+                int ok = encode_raw_fullres_to_jpeg(raw_info, quality, &recipe, &exif, filename);
                 if (!ok) bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
                 return ok;
             }
@@ -796,9 +895,9 @@ static int silent_pic_save_file(struct raw_info * raw_info)
                     bmp_printf(FONT_MED, 0, 83, "VRAM error");
                     return 0;
                 }
-                if (film_sim > 0 || silent_pic_grain > 0)
+                if (recipe.active)
                 {
-                    apply_film_simulation_yuv422(vram->vram, vram->width, vram->height, vram->pitch, film_sim, silent_pic_grain);
+                    apply_film_recipe_yuv422(vram->vram, vram->width, vram->height, vram->pitch, &recipe);
                 }
                 int ok = encode_yuv422_to_jpeg(vram->vram, vram->width, vram->height, vram->pitch, quality, &exif, filename);
                 if (!ok) bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
@@ -1226,14 +1325,15 @@ silent_pic_take_lv(int interactive)
         printf("[SILENT] Saving JPEG %dx%d (pitch %d) to %s (buf=%p)\n", w, h, pitch, filename, buf);
         bmp_printf(FONT_MED, 0, 60, "Saving JPEG %dx%d...", w, h);
 
-        int film_sim = get_active_film_preset();
+        struct film_recipe recipe;
+        get_effective_film_recipe(&recipe);
         int quality = get_jpeg_quality();
         struct jpeg_exif_tags exif;
-        fill_jpeg_exif(&exif, film_sim);
+        fill_jpeg_exif(&exif, &recipe);
 
-        if (film_sim > 0 || silent_pic_grain > 0)
+        if (recipe.active)
         {
-            apply_film_simulation_yuv422((uint8_t*)buf, w, h, pitch, film_sim, silent_pic_grain);
+            apply_film_recipe_yuv422((uint8_t*)buf, w, h, pitch, &recipe);
         }
 
         ok = encode_yuv422_to_jpeg(buf, w, h, pitch, quality, &exif, filename);
@@ -2063,6 +2163,117 @@ static void silent_snap_task(void * priv)
     silent_log("3: silent_snap_task finished");
 }
 
+/* Silent Timelapse Feature */
+static CONFIG_INT("silent.tl_interval",  silent_tl_interval_idx, 3); /* default 5s */
+static CONFIG_INT("silent.tl_max",       silent_tl_max_idx, 0);      /* default unlimited */
+static CONFIG_INT("silent.tl_powersave", silent_tl_powersave, 0);    /* 0: Screen On, 1: Screen Off */
+
+static const int tl_intervals[] = { 1, 2, 3, 5, 10, 15, 30, 60 };
+static const char * tl_interval_choices[] = { "1 sec", "2 sec", "3 sec", "5 sec", "10 sec", "15 sec", "30 sec", "60 sec" };
+
+static const int tl_max_counts[] = { 0, 50, 100, 250, 500, 1000 };
+static const char * tl_max_choices[] = { "Unlimited", "50", "100", "250", "500", "1000" };
+
+static const char * tl_powersave_choices[] = { "Keep Screen On", "Screen Off (Powersave)" };
+
+static int silent_tl_running = 0;
+static int silent_tl_frame_count = 0;
+
+static void silent_timelapse_task(void * priv)
+{
+    silent_tl_running = 1;
+    silent_tl_frame_count = 0;
+    silent_pic_enabled = 1;
+    gui_stop_menu();
+    msleep(500);
+
+    int interval_sec = tl_intervals[COERCE(silent_tl_interval_idx, 0, 7)];
+    int max_frames = tl_max_counts[COERCE(silent_tl_max_idx, 0, 5)];
+
+    while (silent_tl_running)
+    {
+        if (max_frames > 0 && silent_tl_frame_count >= max_frames)
+        {
+            break;
+        }
+
+        if (get_halfshutter_pressed())
+        {
+            beep();
+            bmp_printf(FONT_MED, 0, 60, "Timelapse stopped by user.");
+            break;
+        }
+
+        bmp_printf(FONT_MED, 0, 60, "Timelapse shot %d...", silent_tl_frame_count + 1);
+
+        int ok = 0;
+        if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
+        {
+            ok = silent_pic_take_fullres(0);
+        }
+        else
+        {
+            ok = silent_pic_take_lv(0);
+        }
+
+        if (ok)
+        {
+            silent_tl_frame_count++;
+        }
+
+        if (silent_tl_powersave == 1)
+        {
+            display_off();
+        }
+
+        int wait_ticks = (interval_sec * 1000) / 100;
+        for (int i = 0; i < wait_ticks && silent_tl_running; i++)
+        {
+            msleep(100);
+            if (get_halfshutter_pressed())
+            {
+                silent_tl_running = 0;
+                break;
+            }
+        }
+
+        if (silent_tl_powersave == 1)
+        {
+            display_on();
+        }
+    }
+
+    silent_tl_running = 0;
+    beep();
+    bmp_printf(FONT_MED, 0, 60, "Timelapse finished: %d frames.", silent_tl_frame_count);
+}
+
+static void silent_tl_action(void * priv, int delta)
+{
+    if (silent_tl_running)
+    {
+        silent_tl_running = 0;
+        beep();
+    }
+    else
+    {
+        task_create("silent_tl", 0x1c, 0x2000, silent_timelapse_task, 0);
+    }
+}
+
+static MENU_UPDATE_FUNC(silent_tl_status_update)
+{
+    if (silent_tl_running)
+    {
+        MENU_SET_VALUE("STOP (%d frames)", silent_tl_frame_count);
+    }
+    else
+    {
+        int interval_sec = tl_intervals[COERCE(silent_tl_interval_idx, 0, 7)];
+        MENU_SET_VALUE("Start (Every %ds)", interval_sec);
+    }
+}
+
 static void silent_pic_snap_now(void * priv, int delta)
 {
     silent_log("0: silent_pic_snap_now invoked");
@@ -2182,6 +2393,42 @@ static struct menu_entry silent_menu[] = {
                 .choices = CHOICES("Off", "Subtle", "Medium", "Heavy"),
                 .help = "Hardware LFSR film grain injected into Silent JPEG captures.",
             },
+            {
+                .name = "Silent Timelapse",
+                .update = silent_tl_status_update,
+                .select = silent_tl_action,
+                .help = "Electronic zero-shutter-wear timelapse directly to JPEG.",
+                .children = (struct menu_entry[]) {
+                    {
+                        .name = "Action",
+                        .update = silent_tl_status_update,
+                        .select = silent_tl_action,
+                        .help = "Start or Stop the silent timelapse sequence.",
+                    },
+                    {
+                        .name = "Take Frame Every",
+                        .priv = &silent_tl_interval_idx,
+                        .max = 7,
+                        .choices = tl_interval_choices,
+                        .help = "Interval between consecutive silent exposures.",
+                    },
+                    {
+                        .name = "Total Frames",
+                        .priv = &silent_tl_max_idx,
+                        .max = 5,
+                        .choices = tl_max_choices,
+                        .help = "Stop automatically after this many frames (or Unlimited).",
+                    },
+                    {
+                        .name = "Display Powersave",
+                        .priv = &silent_tl_powersave,
+                        .max = 1,
+                        .choices = tl_powersave_choices,
+                        .help = "Turn off screen between shots to maximize battery life.",
+                    },
+                    MENU_EOL
+                },
+            },
             MENU_EOL,
         }
         #endif
@@ -2243,6 +2490,11 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(silent_pic_fullres_trigger_mode)
     MODULE_CONFIG(silent_pic_file_format)
     MODULE_CONFIG(silent_pic_film_sim)
+    MODULE_CONFIG(silent_pic_quality)
+    MODULE_CONFIG(silent_pic_grain)
+    MODULE_CONFIG(silent_tl_interval_idx)
+    MODULE_CONFIG(silent_tl_max_idx)
+    MODULE_CONFIG(silent_tl_powersave)
 MODULE_CONFIGS_END()
 
 MODULE_PROPHANDLERS_START()

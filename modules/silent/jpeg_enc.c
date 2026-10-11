@@ -434,9 +434,74 @@ static inline void apply_film_stock(uint32_t preset, uint8_t* py0, uint8_t* py1,
     *pv  = (uint8_t)v;
 }
 
-void apply_film_simulation_yuv422(uint8_t* uyvy_data, int width, int height, int pitch, int film_preset, int grain_strength)
+static inline void apply_recipe_curve(
+    int32_t * py0, int32_t * py1, int32_t * pu, int32_t * pv,
+    int highlight, int shadow, int saturation, int wb_ab, int wb_gm
+)
 {
-    if (!uyvy_data || (film_preset <= 0 && grain_strength <= 0)) return;
+    int32_t y0 = *py0;
+    int32_t y1 = *py1;
+    int32_t u  = *pu;
+    int32_t v  = *pv;
+
+    if (highlight != 0)
+    {
+        if (y0 > 128) {
+            int32_t dy = y0 - 128;
+            y0 = clamp_u8(128 + ((dy * (256 + highlight * 28)) >> 8));
+        }
+        if (y1 > 128) {
+            int32_t dy = y1 - 128;
+            y1 = clamp_u8(128 + ((dy * (256 + highlight * 28)) >> 8));
+        }
+    }
+
+    if (shadow != 0)
+    {
+        if (y0 < 128) {
+            if (shadow > 0) y0 = clamp_u8(y0 + shadow * 6);
+            else y0 = clamp_u8((y0 * (256 + shadow * 36)) >> 8);
+        }
+        if (y1 < 128) {
+            if (shadow > 0) y1 = clamp_u8(y1 + shadow * 6);
+            else y1 = clamp_u8((y1 * (256 + shadow * 36)) >> 8);
+        }
+    }
+
+    if (saturation != 0)
+    {
+        int32_t sat_mult = 256 + saturation * 44;
+        u = clamp_u8(128 + (((u - 128) * sat_mult) >> 8));
+        v = clamp_u8(128 + (((v - 128) * sat_mult) >> 8));
+    }
+
+    if (wb_ab != 0)
+    {
+        u = clamp_u8(u - wb_ab * 2);
+        v = clamp_u8(v + wb_ab * 2);
+    }
+
+    if (wb_gm != 0)
+    {
+        u = clamp_u8(u - wb_gm * 2);
+        v = clamp_u8(v - wb_gm * 2);
+    }
+
+    *py0 = y0;
+    *py1 = y1;
+    *pu  = u;
+    *pv  = v;
+}
+
+void apply_film_recipe_yuv422(
+    uint8_t* uyvy_data,
+    int width,
+    int height,
+    int pitch,
+    const struct film_recipe* recipe
+)
+{
+    if (!uyvy_data || !recipe || !recipe->active) return;
 
     for (int y = 0; y < height; y++)
     {
@@ -450,11 +515,35 @@ void apply_film_simulation_yuv422(uint8_t* uyvy_data, int width, int height, int
             uint8_t v  = (uint8_t)((val >> 16) & 0xFF);
             uint8_t y1 = (uint8_t)((val >> 24) & 0xFF);
 
-            apply_film_stock((uint32_t)film_preset, &y0, &y1, &u, &v, grain_strength);
+            if (recipe->base_stock > 0 && recipe->base_stock <= 5)
+            {
+                apply_film_stock((uint32_t)recipe->base_stock, &y0, &y1, &u, &v, 0);
+            }
 
-            row[i] = (uint32_t)u | ((uint32_t)y0 << 8) | ((uint32_t)v << 16) | ((uint32_t)y1 << 24);
+            int32_t iy0 = y0, iy1 = y1, iu = u, iv = v;
+            apply_recipe_curve(&iy0, &iy1, &iu, &iv,
+                recipe->highlight, recipe->shadow, recipe->saturation,
+                recipe->wb_ab, recipe->wb_gm);
+
+            if (recipe->grain > 0)
+            {
+                iy0 = clamp_u8(iy0 + next_film_grain(recipe->grain));
+                iy1 = clamp_u8(iy1 + next_film_grain(recipe->grain));
+            }
+
+            row[i] = (uint32_t)clamp_u8(iu) | ((uint32_t)clamp_u8(iy0) << 8) | ((uint32_t)clamp_u8(iv) << 16) | ((uint32_t)clamp_u8(iy1) << 24);
         }
     }
+}
+
+void apply_film_simulation_yuv422(uint8_t* uyvy_data, int width, int height, int pitch, int film_preset, int grain_strength)
+{
+    struct film_recipe r;
+    memset(&r, 0, sizeof(r));
+    r.active = 1;
+    r.base_stock = film_preset;
+    r.grain = grain_strength;
+    apply_film_recipe_yuv422(uyvy_data, width, height, pitch, &r);
 }
 
 static void init_raw_gamma_luts(int black, int white)
@@ -919,7 +1008,7 @@ int encode_yuv422_to_jpeg(
 int encode_raw_fullres_to_jpeg(
     const struct raw_info* raw,
     int quality,
-    int film_preset,
+    const struct film_recipe* recipe,
     const struct jpeg_exif_tags* exif,
     const char* out_path
 ) {
@@ -951,14 +1040,13 @@ int encode_raw_fullres_to_jpeg(
     int mcu_h = 8;
     int mcus_y = (height + mcu_h - 1) / mcu_h;
     int strip_pitch = width * 2;
-    int grain = exif ? exif->grain_strength : 0;
 
     for (int my = 0; my < mcus_y; my++) {
         int py0 = my * mcu_h;
         debayer_raw_8lines(raw, py0, strip_buf, width, strip_pitch);
 
-        if ((film_preset > 0 && film_preset <= 5) || grain > 0) {
-            apply_film_simulation_yuv422(strip_buf, width, 8, strip_pitch, film_preset, grain);
+        if (recipe && recipe->active) {
+            apply_film_recipe_yuv422(strip_buf, width, 8, strip_pitch, recipe);
         }
 
         encode_mcu_row(strip_buf, width, strip_pitch, 8, &prev_dc_y, &prev_dc_u, &prev_dc_v);

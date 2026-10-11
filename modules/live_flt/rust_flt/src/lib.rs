@@ -228,6 +228,69 @@ pub unsafe extern "C" fn rust_flt_get_crop_bounds(
     if !xmax.is_null() { *xmax = x_max; }
 }
 
+#[inline(always)]
+fn apply_recipe(
+    mut y0: u8,
+    mut y1: u8,
+    mut u: u8,
+    mut v: u8,
+    highlight: i32,
+    shadow: i32,
+    saturation: i32,
+    wb_ab: i32,
+    wb_gm: i32,
+) -> (u8, u8, u8, u8) {
+    if highlight != 0 {
+        let adj_h = |y: u8| -> u8 {
+            let yi = y as i32;
+            if yi > 128 {
+                let dy = yi - 128;
+                clamp_u8(128 + ((dy * (256 + highlight * 28)) >> 8))
+            } else {
+                y
+            }
+        };
+        y0 = adj_h(y0);
+        y1 = adj_h(y1);
+    }
+
+    if shadow != 0 {
+        let adj_s = |y: u8| -> u8 {
+            let yi = y as i32;
+            if yi < 128 {
+                if shadow > 0 {
+                    clamp_u8(yi + shadow * 6)
+                } else {
+                    clamp_u8((yi * (256 + shadow * 36)) >> 8)
+                }
+            } else {
+                y
+            }
+        };
+        y0 = adj_s(y0);
+        y1 = adj_s(y1);
+    }
+
+    if saturation != 0 {
+        let sat_mult = 256 + saturation * 44;
+        let u_diff = u as i32 - 128;
+        let v_diff = v as i32 - 128;
+        u = clamp_u8(128 + ((u_diff * sat_mult) >> 8));
+        v = clamp_u8(128 + ((v_diff * sat_mult) >> 8));
+    }
+
+    if wb_ab != 0 {
+        u = clamp_u8(u as i32 - wb_ab * 2);
+        v = clamp_u8(v as i32 + wb_ab * 2);
+    }
+    if wb_gm != 0 {
+        u = clamp_u8(u as i32 - wb_gm * 2);
+        v = clamp_u8(v as i32 - wb_gm * 2);
+    }
+
+    (y0, y1, u, v)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn rust_flt_process_row(
     row_src: *const u32,
@@ -247,6 +310,12 @@ pub unsafe extern "C" fn rust_flt_process_row(
     gnd_y_end: i32,
     nd_active: i32,
     nd_shift: i32,
+    recipe_active: i32,
+    rec_highlight: i32,
+    rec_shadow: i32,
+    rec_saturation: i32,
+    rec_wb_ab: i32,
+    rec_wb_gm: i32,
 ) {
     let row_outside_v = (has_crop != 0) && (y < ymin || y >= ymax);
     let row_border_v  = (has_crop != 0) && (y == ymin || y == ymax - 1);
@@ -278,7 +347,6 @@ pub unsafe extern "C" fn rust_flt_process_row(
                 } else if y <= gnd_y_end {
                     let factor_min = 256 >> gnd_shift;
                     let denom = (gnd_y_end - gnd_y_start + 1).max(1);
-                    // Safe linear interpolation without division panics
                     let factor = factor_min + ((256 - factor_min) * (y - gnd_y_start)) / denom;
                     let factor_clamped = if factor > 256 { 256 } else { factor };
                     y0 = ((y0 as i32 * factor_clamped) >> 8) as u8;
@@ -287,12 +355,21 @@ pub unsafe extern "C" fn rust_flt_process_row(
             } else if nd_active != 0 {
                 y0 >>= nd_shift;
                 y1 >>= nd_shift;
-            } else if film_preset > 0 && film_preset <= 5 {
-                let res = apply_film_stock(film_preset, y0, y1, u, v);
-                y0 = res.0;
-                y1 = res.1;
-                u  = res.2;
-                v  = res.3;
+            } else {
+                if film_preset > 0 && film_preset <= 5 {
+                    let res = apply_film_stock(film_preset, y0, y1, u, v);
+                    y0 = res.0;
+                    y1 = res.1;
+                    u  = res.2;
+                    v  = res.3;
+                }
+                if recipe_active != 0 {
+                    let rec = apply_recipe(y0, y1, u, v, rec_highlight, rec_shadow, rec_saturation, rec_wb_ab, rec_wb_gm);
+                    y0 = rec.0;
+                    y1 = rec.1;
+                    u  = rec.2;
+                    v  = rec.3;
+                }
             }
         }
 

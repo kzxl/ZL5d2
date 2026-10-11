@@ -28,6 +28,22 @@ struct jpeg_exif_tags {
 };
 
 /**
+ * Computational Film Recipe container.
+ * Supports Fujifilm-style tone curves, white balance shifts, and analog grain injection.
+ */
+struct film_recipe {
+    int active;         // 1: Active, 0: Disabled
+    int base_stock;     // 0: Off, 1: Portra, 2: Velvia, 3: Cinestill, 4: Tri-X, 5: Classic Chrome
+    int highlight;      // -2 .. +2
+    int shadow;         // -2 .. +2
+    int saturation;     // -2 .. +2
+    int wb_ab;          // -9 .. +9 (Amber / Blue)
+    int wb_gm;          // -9 .. +9 (Green / Magenta)
+    int grain;          // 0: Off, 1: Subtle, 2: Med, 3: Heavy
+    const char* name;   // Recipe name for EXIF / OSD, e.g. "Portra Warm"
+};
+
+/**
  * Encodes a UYVY (YUV 4:2:2) buffer directly to a standard Baseline JPEG file with optional EXIF.
  * 
  * Safety & Memory Guarantees:
@@ -66,7 +82,7 @@ int encode_yuv422_to_jpeg(
  *
  * @param raw         Pointer to camera raw_info containing sensor buffer & dimensions.
  * @param quality     JPEG quality factor (1..100).
- * @param film_preset Film simulation stock (0: Off, 1: Portra 400, 2: Velvia 50, 3: Cinestill 800T, 4: Tri-X 400, 5: Classic Chrome).
+ * @param recipe      Pointer to optional film recipe parameters (can be NULL).
  * @param exif        Pointer to optional EXIF metadata tags (can be NULL).
  * @param out_path    Output path on CF card (e.g. "A:/DCIM/100EOS5D/51780001.JPG").
  * @return 1 on success, 0 on failure.
@@ -74,7 +90,7 @@ int encode_yuv422_to_jpeg(
 int encode_raw_fullres_to_jpeg(
     const struct raw_info* raw,
     int quality,
-    int film_preset,
+    const struct film_recipe* recipe,
     const struct jpeg_exif_tags* exif,
     const char* out_path
 );
@@ -96,6 +112,23 @@ void apply_film_simulation_yuv422(
     int pitch,
     int film_preset,
     int grain_strength
+);
+
+/**
+ * Applies a full Film Recipe (base stock + tone curves + WB shift + grain) to a YUV422 buffer in-place.
+ *
+ * @param uyvy_data      Pointer to start of UYVY image buffer.
+ * @param width          Image width in pixels.
+ * @param height         Image height in pixels.
+ * @param pitch          Byte stride per row.
+ * @param recipe         Pointer to configured film recipe parameters.
+ */
+void apply_film_recipe_yuv422(
+    uint8_t* uyvy_data,
+    int width,
+    int height,
+    int pitch,
+    const struct film_recipe* recipe
 );
 
 #endif // _JPEG_ENC_H_
