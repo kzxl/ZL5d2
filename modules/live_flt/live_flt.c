@@ -300,8 +300,14 @@ static void recipe_load_custom(void * priv, int delta)
     bmp_printf(FONT_MED, 0, 60, "Loaded CUSTOM.REC");
 }
 
-static void recipe_inspect_curve(void * priv, int delta)
+static int curve_insp_in_progress = 0;
+
+static void recipe_inspect_curve_task(void * priv)
 {
+    curve_insp_in_progress = 1;
+    gui_stop_menu();
+    msleep(400);
+
     int base = 0, high = 0, shadow = 0, sat = 0, wb_ab = 0, wb_gm = 0, grain = 0;
     const char * name = NULL;
     get_effective_recipe_params(&base, &high, &shadow, &sat, &wb_ab, &wb_gm, &grain, &name);
@@ -369,15 +375,23 @@ static void recipe_inspect_curve(void * priv, int delta)
     bmp_printf(FONT_MED, tx, ty + 6 * dy_line, "WB G/M:    %+d", wb_gm);
     bmp_printf(FONT_MED, tx, ty + 7 * dy_line, "Film Grain:%s", grain_choices[COERCE(grain, 0, 3)]);
 
-    bmp_printf(FONT_SMALL, win_x + 30, win_y + win_h - 26, "Half-shutter or wait 4s to close...");
+    bmp_printf(FONT_SMALL, win_x + 30, win_y + win_h - 26, "Half-shutter or wait 5s to close...");
 
     /* Wait for half-shutter or timeout */
-    for (int t = 0; t < 40; t++)
+    for (int t = 0; t < 50; t++)
     {
         if (get_halfshutter_pressed()) break;
         msleep(100);
     }
+    clrscr();
     redraw();
+    curve_insp_in_progress = 0;
+}
+
+static void recipe_inspect_curve(void * priv, int delta)
+{
+    if (curve_insp_in_progress) return;
+    task_create("curve_insp", 0x1c, 0x2000, recipe_inspect_curve_task, 0);
 }
 
 static unsigned int live_flt_display_cbr(unsigned int ctx)

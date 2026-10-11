@@ -63,6 +63,20 @@ static const char * bracket_steps_choices[] = { "OFF", "3 Frames (0 - +)", "5 Fr
 static const char * bracket_stepsize_choices[] = { "1.0 EV", "2.0 EV", "0.5 EV" };
 
 static int silent_bracket_active = 0;
+static int silent_snap_in_progress = 0;
+static struct semaphore * silent_capture_sem = NULL;
+
+static inline int silent_lock_capture(void)
+{
+    if (!silent_capture_sem) return 1;
+    return (take_semaphore(silent_capture_sem, 0) == 0);
+}
+
+static inline void silent_unlock_capture(void)
+{
+    if (silent_capture_sem)
+        give_semaphore(silent_capture_sem);
+}
 
 static const char* film_sim_labels[] = {
     "Auto (Look)", "Off", "Portra 400", "Velvia 50", "Cinestill 800T", "Tri-X 400", "Classic Chrome"
@@ -1302,11 +1316,18 @@ static int silent_pic_raw_prepare_buffers(struct memSuite * mem_suite, int initi
 static int
 silent_pic_take_lv(int interactive)
 {
+    if (!silent_lock_capture())
+    {
+        silent_log("silent_pic_take_lv: engine busy");
+        return 0;
+    }
+
     if (silent_pic_file_format != SILENT_PIC_FILE_FORMAT_JPEG)
     {
         if (lens_info.job_state || !lv)
         {
             /* only works in LV, and conflicts with regular picture taking */
+            silent_unlock_capture();
             return 0;
         }
     }
@@ -1322,6 +1343,7 @@ silent_pic_take_lv(int interactive)
         {
             printf("[SILENT] get_yuv422_vram returned NULL\n");
             bmp_printf(FONT_MED, 0, 83, "VRAM error");
+            silent_unlock_capture();
             return 0;
         }
         void * buf = vram->vram;
@@ -1438,6 +1460,7 @@ silent_pic_take_lv(int interactive)
             bmp_printf(FONT_MED, 0, 60, "Saved %s", filename);
         }
         redraw();
+        silent_unlock_capture();
         return ok;
     }
 
@@ -1734,6 +1757,7 @@ cleanup:
 
     ResumeLiveView();
 
+    silent_unlock_capture();
     return ok;
 }
 #endif
@@ -1796,6 +1820,12 @@ static void long_exposure_fix()
 static int
 silent_pic_take_fullres(int interactive)
 {
+    if (!silent_lock_capture())
+    {
+        silent_log("silent_pic_take_fullres: engine busy");
+        return 0;
+    }
+
     int ok = 1;
 
     /* capture metadata from LiveView; will override invalid values later */
@@ -2061,6 +2091,7 @@ cleanup:
     long_exposure_fix();
     gui_uilock(UILOCK_NONE);
     
+    silent_unlock_capture();
     return ok;
 
 err:
@@ -2071,6 +2102,7 @@ err:
     }
     gui_uilock(UILOCK_NONE);
     ResumeLiveView();
+    silent_unlock_capture();
     return 0;
 }
 
@@ -2109,8 +2141,15 @@ static int silent_pic_take_bracket(int interactive)
         tv_offsets[4] = -2 * ev_units;
     }
 
+    int shots_completed = 0;
     for (int i = 0; i < total_shots; i++)
     {
+        if (i > 0 && get_halfshutter_pressed())
+        {
+            silent_log("silent_pic_take_bracket: aborted by user");
+            break;
+        }
+
         int target_tv = COERCE(old_tv + tv_offsets[i], 16, FASTEST_SHUTTER_SPEED_RAW);
         lens_set_rawshutter(target_tv);
         msleep(150);
@@ -2118,25 +2157,18 @@ static int silent_pic_take_bracket(int interactive)
         bmp_printf(FONT_MED, 0, 60, "Silent Bracket %d/%d (EV %+d)...", i + 1, total_shots, -tv_offsets[i] / 8);
         if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
         {
-            silent_pic_take_fullres(0);
+            if (silent_pic_take_fullres(0)) shots_completed++;
         }
         else
         {
-            silent_pic_take_lv(0);
+            if (silent_pic_take_lv(0)) shots_completed++;
         }
     }
 
     lens_set_rawshutter(old_tv);
     silent_bracket_active = 0;
-    bmp_printf(FONT_MED, 0, 60, "Silent Bracket complete (%d shots)", total_shots);
-    return 1;
-}
-
-static void silent_bracket_snap(void * priv, int delta)
-{
-    gui_stop_menu();
-    msleep(500);
-    silent_pic_take_bracket(1);
+    bmp_printf(FONT_MED, 0, 60, "Silent Bracket complete (%d/%d shots)", shots_completed, total_shots);
+    return (shots_completed > 0);
 }
 
 static unsigned int
@@ -2147,6 +2179,12 @@ silent_pic_take(unsigned int interactive) // for remote release, set interactive
         /* tell the photo taking backend that no custom picture was taken */
         /* (so it should try another custom picture handler or a regular picture) */
         return CBR_RET_CONTINUE;
+    }
+
+    if (silent_bracket_active || silent_snap_in_progress)
+    {
+        silent_log("silent_pic_take: capture in progress, ignoring trigger");
+        return CBR_RET_STOP;
     }
 
     if (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_MLV && !silent_pic_mlv_available)
@@ -2305,6 +2343,7 @@ static unsigned int silent_pic_polling_cbr(unsigned int ctx)
 
 static void silent_snap_task(void * priv)
 {
+    silent_snap_in_progress = 1;
     silent_log("1: silent_snap_task started");
     silent_pic_enabled = 1;
     gui_stop_menu();
@@ -2323,6 +2362,7 @@ static void silent_snap_task(void * priv)
     {
         silent_pic_take_lv(1);
     }
+    silent_snap_in_progress = 0;
     silent_log("3: silent_snap_task finished");
 }
 
@@ -2365,6 +2405,12 @@ static void silent_timelapse_task(void * priv)
             beep();
             bmp_printf(FONT_MED, 0, 60, "Timelapse stopped by user.");
             break;
+        }
+
+        if (gui_menu_shown() || silent_bracket_active || silent_snap_in_progress)
+        {
+            msleep(500);
+            continue;
         }
 
         bmp_printf(FONT_MED, 0, 60, "Timelapse shot %d...", silent_tl_frame_count + 1);
@@ -2420,6 +2466,11 @@ static void silent_tl_action(void * priv, int delta)
     }
     else
     {
+        if (silent_bracket_active || silent_snap_in_progress)
+        {
+            bmp_printf(FONT_MED, 0, 60, "Silent capture in progress...");
+            return;
+        }
         task_create("silent_tl", 0x1c, 0x2000, silent_timelapse_task, 0);
     }
 }
@@ -2439,7 +2490,23 @@ static MENU_UPDATE_FUNC(silent_tl_status_update)
 
 static void silent_pic_snap_now(void * priv, int delta)
 {
+    if (silent_snap_in_progress || silent_bracket_active)
+    {
+        bmp_printf(FONT_MED, 0, 100, "Silent capture in progress...");
+        return;
+    }
     silent_log("0: silent_pic_snap_now invoked");
+    task_create("silent_snap", 0x1c, 0x2000, silent_snap_task, 0);
+}
+
+static void silent_bracket_snap(void * priv, int delta)
+{
+    if (silent_snap_in_progress || silent_bracket_active)
+    {
+        bmp_printf(FONT_MED, 0, 100, "Silent capture in progress...");
+        return;
+    }
+    silent_log("0: silent_bracket_snap invoked");
     task_create("silent_snap", 0x1c, 0x2000, silent_snap_task, 0);
 }
 
@@ -2654,6 +2721,8 @@ static struct menu_entry silent_menu[] = {
 
 static unsigned int silent_init()
 {
+    silent_capture_sem = create_named_semaphore("silent_cap_sem", SEM_CREATE_UNLOCKED);
+
     /* fixme in core: prop handlers should trigger when initializing, but they do not */
     prop_iso = lens_info.raw_iso;
     prop_shutter = lens_info.raw_shutter;
