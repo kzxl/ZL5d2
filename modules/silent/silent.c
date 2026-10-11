@@ -52,6 +52,17 @@ static CONFIG_INT( "silent.pic.file_format", silent_pic_file_format, 0 );
 static CONFIG_INT( "silent.pic.film_sim", silent_pic_film_sim, 0 );
 static CONFIG_INT( "silent.pic.quality", silent_pic_quality, 1 ); // 0: 70%, 1: 85%, 2: 95%, 3: 98%
 static CONFIG_INT( "silent.pic.grain", silent_pic_grain, 0 );     // 0: Off, 1: Subtle, 2: Medium, 3: Heavy
+static CONFIG_INT( "silent.multiexp", silent_pic_multiexp, 0 );
+static CONFIG_INT( "silent.multiexp_blend", silent_pic_multiexp_blend, 0 );
+static CONFIG_INT( "silent.bracket_steps", silent_pic_bracket_steps, 0 );
+static CONFIG_INT( "silent.bracket_stepsize", silent_pic_bracket_stepsize, 0 );
+
+static const char * multiexp_choices[] = { "OFF", "2 Frames", "3 Frames", "4 Frames", "8 Frames (ND)" };
+static const char * multiexp_blend_choices[] = { "Average", "Additive", "Screen" };
+static const char * bracket_steps_choices[] = { "OFF", "3 Frames (0 - +)", "5 Frames (0 - - + +)", "3 Frames (- 0 +)" };
+static const char * bracket_stepsize_choices[] = { "1.0 EV", "2.0 EV", "0.5 EV" };
+
+static int silent_bracket_active = 0;
 
 static const char* film_sim_labels[] = {
     "Auto (Look)", "Off", "Portra 400", "Velvia 50", "Cinestill 800T", "Tri-X 400", "Classic Chrome"
@@ -1317,6 +1328,78 @@ silent_pic_take_lv(int interactive)
         int w = vram->width ? vram->width : 720;
         int h = vram->height ? vram->height : 480;
         int pitch = vram->pitch ? vram->pitch : 1440;
+        int frame_bytes = pitch * h;
+
+        uint8_t * accum = NULL;
+        int num_frames = 1;
+        if (silent_pic_multiexp > 0 && !silent_bracket_active)
+        {
+            num_frames = (silent_pic_multiexp == 1) ? 2 :
+                         (silent_pic_multiexp == 2) ? 3 :
+                         (silent_pic_multiexp == 3) ? 4 : 8;
+            accum = fio_malloc(frame_bytes);
+            if (accum)
+            {
+                memcpy(accum, vram->vram, frame_bytes);
+                buf = accum;
+            }
+        }
+
+        if (accum && num_frames > 1)
+        {
+            for (int k = 1; k < num_frames; k++)
+            {
+                bmp_printf(FONT_MED, 0, 60, "Multi-Exp blend %d/%d...", k + 1, num_frames);
+                msleep(120);
+                vram = get_yuv422_vram();
+                if (!vram || !vram->vram) break;
+
+                uint8_t * cur = (uint8_t*)vram->vram;
+                int blend_mode = silent_pic_multiexp_blend;
+
+                /* Process in 4-byte UYVY pixel pairs */
+                for (int p = 0; p < frame_bytes; p += 4)
+                {
+                    uint8_t u_a  = accum[p + 0];
+                    uint8_t y0_a = accum[p + 1];
+                    uint8_t v_a  = accum[p + 2];
+                    uint8_t y1_a = accum[p + 3];
+
+                    uint8_t u_b  = cur[p + 0];
+                    uint8_t y0_b = cur[p + 1];
+                    uint8_t v_b  = cur[p + 2];
+                    uint8_t y1_b = cur[p + 3];
+
+                    if (blend_mode == 0) /* Average */
+                    {
+                        accum[p + 1] = (uint8_t)(((int)y0_a * k + (int)y0_b) / (k + 1));
+                        accum[p + 3] = (uint8_t)(((int)y1_a * k + (int)y1_b) / (k + 1));
+                        accum[p + 0] = (uint8_t)(128 + (((int)u_a - 128) * k + ((int)u_b - 128)) / (k + 1));
+                        accum[p + 2] = (uint8_t)(128 + (((int)v_a - 128) * k + ((int)v_b - 128)) / (k + 1));
+                    }
+                    else if (blend_mode == 1) /* Additive */
+                    {
+                        int y0 = (int)y0_a + (int)y0_b;
+                        int y1 = (int)y1_a + (int)y1_b;
+                        accum[p + 1] = (y0 > 255) ? 255 : y0;
+                        accum[p + 3] = (y1 > 255) ? 255 : y1;
+                        int u = 128 + ((int)u_a - 128) + ((int)u_b - 128);
+                        int v = 128 + ((int)v_a - 128) + ((int)v_b - 128);
+                        accum[p + 0] = COERCE(u, 0, 255);
+                        accum[p + 2] = COERCE(v, 0, 255);
+                    }
+                    else /* Screen */
+                    {
+                        int y0 = 255 - ((255 - (int)y0_a) * (255 - (int)y0_b)) / 255;
+                        int y1 = 255 - ((255 - (int)y1_a) * (255 - (int)y1_b)) / 255;
+                        accum[p + 1] = (y0 > 255) ? 255 : y0;
+                        accum[p + 3] = (y1 > 255) ? 255 : y1;
+                        accum[p + 0] = (uint8_t)(128 + (((int)u_a - 128) + ((int)u_b - 128)) / 2);
+                        accum[p + 2] = (uint8_t)(128 + (((int)v_a - 128) + ((int)v_b - 128)) / 2);
+                    }
+                }
+            }
+        }
 
         silent_capture_lv_metadata();
         char * filename = silent_pic_get_name();
@@ -1337,6 +1420,12 @@ silent_pic_take_lv(int interactive)
         }
 
         ok = encode_yuv422_to_jpeg(buf, w, h, pitch, quality, &exif, filename);
+        if (accum)
+        {
+            fio_free(accum);
+            accum = NULL;
+        }
+
         if (ok) silent_log("encode_yuv422_to_jpeg returned SUCCESS (1)");
         else silent_log("encode_yuv422_to_jpeg returned FAILURE (0)");
         if (!ok)
@@ -1985,6 +2074,71 @@ err:
     return 0;
 }
 
+#ifndef FASTEST_SHUTTER_SPEED_RAW
+#define FASTEST_SHUTTER_SPEED_RAW 160
+#endif
+
+static int silent_pic_take_bracket(int interactive)
+{
+    if (silent_bracket_active) return 0;
+    silent_bracket_active = 1;
+
+    int old_tv = lens_info.raw_shutter;
+    int ev_units = (silent_pic_bracket_stepsize == 0) ? 8 : (silent_pic_bracket_stepsize == 1) ? 16 : 4;
+    int total_shots = (silent_pic_bracket_steps == 2) ? 5 : 3;
+
+    int tv_offsets[5];
+    if (silent_pic_bracket_steps == 1) /* 0, -, + */
+    {
+        tv_offsets[0] = 0;
+        tv_offsets[1] = ev_units;
+        tv_offsets[2] = -ev_units;
+    }
+    else if (silent_pic_bracket_steps == 3) /* -, 0, + */
+    {
+        tv_offsets[0] = ev_units;
+        tv_offsets[1] = 0;
+        tv_offsets[2] = -ev_units;
+    }
+    else /* 5 frames: 0, -, +, --, ++ */
+    {
+        tv_offsets[0] = 0;
+        tv_offsets[1] = ev_units;
+        tv_offsets[2] = -ev_units;
+        tv_offsets[3] = 2 * ev_units;
+        tv_offsets[4] = -2 * ev_units;
+    }
+
+    for (int i = 0; i < total_shots; i++)
+    {
+        int target_tv = COERCE(old_tv + tv_offsets[i], 16, FASTEST_SHUTTER_SPEED_RAW);
+        lens_set_rawshutter(target_tv);
+        msleep(150);
+
+        bmp_printf(FONT_MED, 0, 60, "Silent Bracket %d/%d (EV %+d)...", i + 1, total_shots, -tv_offsets[i] / 8);
+        if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
+        {
+            silent_pic_take_fullres(0);
+        }
+        else
+        {
+            silent_pic_take_lv(0);
+        }
+    }
+
+    lens_set_rawshutter(old_tv);
+    silent_bracket_active = 0;
+    bmp_printf(FONT_MED, 0, 60, "Silent Bracket complete (%d shots)", total_shots);
+    return 1;
+}
+
+static void silent_bracket_snap(void * priv, int delta)
+{
+    gui_stop_menu();
+    msleep(500);
+    silent_pic_take_bracket(1);
+}
+
 static unsigned int
 silent_pic_take(unsigned int interactive) // for remote release, set interactive=0
 {
@@ -2001,6 +2155,11 @@ silent_pic_take(unsigned int interactive) // for remote release, set interactive
         
         /* user error; do not try to take a regular picture if this fails */
         return CBR_RET_STOP;
+    }
+
+    if (silent_pic_bracket_steps > 0 && !silent_bracket_active)
+    {
+        return silent_pic_take_bracket(interactive) ? CBR_RET_STOP : CBR_RET_ERROR;
     }
     
     silent_log("silent_pic_take entered");
@@ -2152,7 +2311,11 @@ static void silent_snap_task(void * priv)
     msleep(500);
     silent_log("2: menu stopped, calling capture");
     bmp_printf(FONT_MED, 0, 100, "Snap Now executing...");
-    if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
+    if (silent_pic_bracket_steps > 0)
+    {
+        silent_pic_take_bracket(1);
+    }
+    else if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
     {
         silent_pic_take_fullres(1);
     }
@@ -2429,6 +2592,59 @@ static struct menu_entry silent_menu[] = {
                     MENU_EOL
                 },
             },
+            {
+                .name = "Multi-Exposure",
+                .priv = &silent_pic_multiexp,
+                .max = 4,
+                .choices = multiexp_choices,
+                .help = "Electronic double/multi-exposure blending directly to JPEG.",
+                .children = (struct menu_entry[]) {
+                    {
+                        .name = "Exposures",
+                        .priv = &silent_pic_multiexp,
+                        .max = 4,
+                        .choices = multiexp_choices,
+                        .help = "Number of electronic exposures to blend.",
+                    },
+                    {
+                        .name = "Blend Mode",
+                        .priv = &silent_pic_multiexp_blend,
+                        .max = 2,
+                        .choices = multiexp_blend_choices,
+                        .help = "Average (balanced), Additive (trails), Screen (film look).",
+                    },
+                    MENU_EOL
+                },
+            },
+            {
+                .name = "Silent Bracket (HDR)",
+                .priv = &silent_pic_bracket_steps,
+                .max = 3,
+                .choices = bracket_steps_choices,
+                .help = "Electronic shutter exposure bracketing sequence (0 shutter wear).",
+                .children = (struct menu_entry[]) {
+                    {
+                        .name = "Bracket Frames",
+                        .priv = &silent_pic_bracket_steps,
+                        .max = 3,
+                        .choices = bracket_steps_choices,
+                        .help = "Select number of frames and exposure sequence.",
+                    },
+                    {
+                        .name = "EV Step Size",
+                        .priv = &silent_pic_bracket_stepsize,
+                        .max = 2,
+                        .choices = bracket_stepsize_choices,
+                        .help = "Exposure step increment between bracketed shots.",
+                    },
+                    {
+                        .name = "Bracket Snap Now",
+                        .select = silent_bracket_snap,
+                        .help = "Trigger bracket sequence immediately.",
+                    },
+                    MENU_EOL
+                },
+            },
             MENU_EOL,
         }
         #endif
@@ -2495,6 +2711,10 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(silent_tl_interval_idx)
     MODULE_CONFIG(silent_tl_max_idx)
     MODULE_CONFIG(silent_tl_powersave)
+    MODULE_CONFIG(silent_pic_multiexp)
+    MODULE_CONFIG(silent_pic_multiexp_blend)
+    MODULE_CONFIG(silent_pic_bracket_steps)
+    MODULE_CONFIG(silent_pic_bracket_stepsize)
 MODULE_CONFIGS_END()
 
 MODULE_PROPHANDLERS_START()

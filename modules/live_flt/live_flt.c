@@ -300,6 +300,86 @@ static void recipe_load_custom(void * priv, int delta)
     bmp_printf(FONT_MED, 0, 60, "Loaded CUSTOM.REC");
 }
 
+static void recipe_inspect_curve(void * priv, int delta)
+{
+    int base = 0, high = 0, shadow = 0, sat = 0, wb_ab = 0, wb_gm = 0, grain = 0;
+    const char * name = NULL;
+    get_effective_recipe_params(&base, &high, &shadow, &sat, &wb_ab, &wb_gm, &grain, &name);
+
+    int win_x = 90, win_y = 50, win_w = 540, win_h = 360;
+    bmp_fill(COLOR_BLACK, win_x, win_y, win_w, win_h);
+    bmp_draw_rect(COLOR_WHITE, win_x, win_y, win_w, win_h);
+    bmp_draw_rect(COLOR_GRAY(50), win_x + 2, win_y + 2, win_w - 4, win_h - 4);
+
+    bmp_printf(FONT_LARGE, win_x + 20, win_y + 15, "TONE CURVE INSPECTOR");
+
+    /* Graph coordinates */
+    int gx = win_x + 30, gy = win_y + 70, gw = 220, gh = 220;
+    bmp_fill(COLOR_BLACK, gx, gy, gw, gh);
+    bmp_draw_rect(COLOR_GRAY(50), gx, gy, gw, gh);
+
+    /* Grid lines at 25%, 50%, 75% */
+    for (int p = 1; p <= 3; p++)
+    {
+        int y = gy + gh - (p * gh / 4);
+        int x = gx + (p * gw / 4);
+        draw_line(gx, y, gx + gw, y, COLOR_GRAY(20));
+        draw_line(x, gy, x, gy + gh, COLOR_GRAY(20));
+    }
+
+    /* Neutral 1:1 reference line */
+    draw_line(gx, gy + gh, gx + gw, gy, COLOR_GRAY(50));
+
+    /* Plot actual non-linear tone curve */
+    int prev_px = gx;
+    int prev_py = gy + gh;
+
+    for (int i = 0; i <= gw; i++)
+    {
+        int x_in = (i * 255) / gw;
+        int dy = 0;
+        if (x_in > 128)
+            dy = (high * (x_in - 128) * (255 - x_in)) / 256;
+        else
+            dy = (shadow * x_in * (128 - x_in)) / 256;
+
+        int y_out = COERCE(x_in + dy, 0, 255);
+        int px = gx + i;
+        int py = gy + gh - (y_out * gh / 255);
+
+        if (i > 0)
+        {
+            draw_line(prev_px, prev_py, px, py, COLOR_YELLOW);
+        }
+        prev_px = px;
+        prev_py = py;
+    }
+
+    /* Metadata details panel */
+    int tx = gx + gw + 30;
+    int ty = gy + 10;
+    int dy_line = 24;
+
+    bmp_printf(FONT_MED, tx, ty + 0 * dy_line, "Recipe:    %s", name ? name : "None");
+    bmp_printf(FONT_MED, tx, ty + 1 * dy_line, "Base Stock:%s", (base > 0 && base <= 5) ? recipe_base_choices[base - 1] : "Standard");
+    bmp_printf(FONT_MED, tx, ty + 2 * dy_line, "Highlight: %+d", high);
+    bmp_printf(FONT_MED, tx, ty + 3 * dy_line, "Shadow:    %+d", shadow);
+    bmp_printf(FONT_MED, tx, ty + 4 * dy_line, "Saturation:%+d", sat);
+    bmp_printf(FONT_MED, tx, ty + 5 * dy_line, "WB A/B:    %+d", wb_ab);
+    bmp_printf(FONT_MED, tx, ty + 6 * dy_line, "WB G/M:    %+d", wb_gm);
+    bmp_printf(FONT_MED, tx, ty + 7 * dy_line, "Film Grain:%s", grain_choices[COERCE(grain, 0, 3)]);
+
+    bmp_printf(FONT_SMALL, win_x + 30, win_y + win_h - 26, "Half-shutter or wait 4s to close...");
+
+    /* Wait for half-shutter or timeout */
+    for (int t = 0; t < 40; t++)
+    {
+        if (get_halfshutter_pressed()) break;
+        msleep(100);
+    }
+    redraw();
+}
+
 static unsigned int live_flt_display_cbr(unsigned int ctx)
 {
     if ((!live_flt_film_sim && !live_flt_cine_ratio && !live_flt_recipe_preset) || !lv)
@@ -586,6 +666,11 @@ static struct menu_entry live_flt_menu[] =
                 .name = "Load from CUSTOM.REC",
                 .select = recipe_load_custom,
                 .help = "Import recipe parameters from A:/ML/RECIPES/CUSTOM.REC.",
+            },
+            {
+                .name = "Tone Curve Inspector",
+                .select = recipe_inspect_curve,
+                .help = "Display live graphical tone curve & recipe summary on LCD.",
             },
             MENU_EOL
         },
