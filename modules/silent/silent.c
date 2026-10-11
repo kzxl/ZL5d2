@@ -50,6 +50,8 @@ static CONFIG_INT( "silent.pic.slitscan.mode", silent_pic_slitscan_mode, 0 );
 static CONFIG_INT( "silent.pic.fullres.trigger", silent_pic_fullres_trigger_mode, 0 );
 static CONFIG_INT( "silent.pic.file_format", silent_pic_file_format, 0 );
 static CONFIG_INT( "silent.pic.film_sim", silent_pic_film_sim, 0 );
+static CONFIG_INT( "silent.pic.quality", silent_pic_quality, 1 ); // 0: 70%, 1: 85%, 2: 95%, 3: 98%
+static CONFIG_INT( "silent.pic.grain", silent_pic_grain, 0 );     // 0: Off, 1: Subtle, 2: Medium, 3: Heavy
 
 static const char* film_sim_labels[] = {
     "Auto (Look)", "Off", "Portra 400", "Velvia 50", "Cinestill 800T", "Tri-X 400", "Classic Chrome"
@@ -72,6 +74,67 @@ static int get_active_film_preset(void)
         return silent_pic_film_sim - 1; /* 2 -> 1 (Portra), 3 -> 2 (Velvia), ... */
     }
     return 0; /* 1: Off */
+}
+
+static int get_jpeg_quality(void)
+{
+    switch (silent_pic_quality)
+    {
+        case 0: return 70;  /* Economy */
+        case 1: return 85;  /* Normal */
+        case 2: return 95;  /* Fine */
+        case 3: return 98;  /* SuperFine */
+        default: return 85;
+    }
+}
+
+static void fill_jpeg_exif(struct jpeg_exif_tags * exif, int film_preset)
+{
+    memset(exif, 0, sizeof(*exif));
+    exif->model = "Canon EOS 5D Mark II";
+    exif->lens_name = lens_info.name[0] ? lens_info.name : "EF Lens";
+    exif->iso = lens_info.iso ? lens_info.iso : 100;
+    exif->aperture_x10 = lens_info.aperture ? lens_info.aperture : 28;
+    exif->focal_len = lens_info.focal_len ? lens_info.focal_len : 50;
+    exif->grain_strength = silent_pic_grain;
+
+    if (lens_info.shutter > 0)
+    {
+        if (lens_info.shutter >= 1000)
+        {
+            exif->shutter_num = lens_info.shutter / 1000;
+            exif->shutter_den = 1;
+        }
+        else
+        {
+            exif->shutter_num = 1;
+            exif->shutter_den = lens_info.shutter;
+        }
+    }
+    else
+    {
+        exif->shutter_num = 1;
+        exif->shutter_den = 50;
+    }
+
+    switch (film_preset)
+    {
+        case 1: exif->film_name = "Kodak Portra 400"; break;
+        case 2: exif->film_name = "Fuji Velvia 50"; break;
+        case 3: exif->film_name = "Cinestill 800T"; break;
+        case 4: exif->film_name = "Kodak Tri-X 400"; break;
+        case 5: exif->film_name = "Classic Chrome"; break;
+        default: exif->film_name = "Standard Look"; break;
+    }
+
+    struct tm now;
+    LoadCalendarFromRTC(&now);
+    exif->year  = now.tm_year + 1900;
+    exif->month = now.tm_mon + 1;
+    exif->day   = now.tm_mday;
+    exif->hour  = now.tm_hour;
+    exif->min   = now.tm_min;
+    exif->sec   = now.tm_sec;
 }
 
 static MENU_UPDATE_FUNC(silent_pic_film_sim_display)
@@ -714,11 +777,14 @@ static int silent_pic_save_file(struct raw_info * raw_info)
         {
             char* filename = silent_pic_get_name();
             int film_sim = get_active_film_preset();
+            int quality = get_jpeg_quality();
+            struct jpeg_exif_tags exif;
+            fill_jpeg_exif(&exif, film_sim);
 
             if (raw_info && raw_info->buffer && raw_info->jpeg.width > 1920)
             {
-                bmp_printf(FONT_MED, 0, 60, "Encoding Full-Res JPEG %dx%d...", raw_info->jpeg.width, raw_info->jpeg.height);
-                int ok = encode_raw_fullres_to_jpeg(raw_info, 85, film_sim, filename);
+                bmp_printf(FONT_MED, 0, 60, "Encoding Full-Res JPEG %dx%d (Q%d)...", raw_info->jpeg.width, raw_info->jpeg.height, quality);
+                int ok = encode_raw_fullres_to_jpeg(raw_info, quality, film_sim, &exif, filename);
                 if (!ok) bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
                 return ok;
             }
@@ -730,11 +796,11 @@ static int silent_pic_save_file(struct raw_info * raw_info)
                     bmp_printf(FONT_MED, 0, 83, "VRAM error");
                     return 0;
                 }
-                if (film_sim > 0)
+                if (film_sim > 0 || silent_pic_grain > 0)
                 {
-                    apply_film_simulation_yuv422(vram->vram, vram->width, vram->height, vram->pitch, film_sim);
+                    apply_film_simulation_yuv422(vram->vram, vram->width, vram->height, vram->pitch, film_sim, silent_pic_grain);
                 }
-                int ok = encode_yuv422_to_jpeg(vram->vram, vram->width, vram->height, vram->pitch, 85, filename);
+                int ok = encode_yuv422_to_jpeg(vram->vram, vram->width, vram->height, vram->pitch, quality, &exif, filename);
                 if (!ok) bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
                 return ok;
             }
@@ -1161,12 +1227,16 @@ silent_pic_take_lv(int interactive)
         bmp_printf(FONT_MED, 0, 60, "Saving JPEG %dx%d...", w, h);
 
         int film_sim = get_active_film_preset();
-        if (film_sim > 0)
+        int quality = get_jpeg_quality();
+        struct jpeg_exif_tags exif;
+        fill_jpeg_exif(&exif, film_sim);
+
+        if (film_sim > 0 || silent_pic_grain > 0)
         {
-            apply_film_simulation_yuv422((uint8_t*)buf, w, h, pitch, film_sim);
+            apply_film_simulation_yuv422((uint8_t*)buf, w, h, pitch, film_sim, silent_pic_grain);
         }
 
-        ok = encode_yuv422_to_jpeg(buf, w, h, pitch, 85, filename);
+        ok = encode_yuv422_to_jpeg(buf, w, h, pitch, quality, &exif, filename);
         if (ok) silent_log("encode_yuv422_to_jpeg returned SUCCESS (1)");
         else silent_log("encode_yuv422_to_jpeg returned FAILURE (0)");
         if (!ok)
@@ -2097,6 +2167,20 @@ static struct menu_entry silent_menu[] = {
                 .help = "Film stock emulation applied to JPEG silent captures.",
                 .help2 = "Applies real-time film color science to LiveView and Full-Res JPEGs.\n"
                          "Auto: matches active preset selected in the ML Look tab.",
+            },
+            {
+                .name = "JPEG Quality",
+                .priv = &silent_pic_quality,
+                .max = 3,
+                .choices = CHOICES("Economy (70%)", "Normal (85%)", "Fine (95%)", "SuperFine (98%)"),
+                .help = "Compression quality factor for Silent JPEG captures.",
+            },
+            {
+                .name = "Film Grain (JPEG)",
+                .priv = &silent_pic_grain,
+                .max = 3,
+                .choices = CHOICES("Off", "Subtle", "Medium", "Heavy"),
+                .help = "Hardware LFSR film grain injected into Silent JPEG captures.",
             },
             MENU_EOL,
         }

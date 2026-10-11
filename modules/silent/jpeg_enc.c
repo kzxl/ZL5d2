@@ -122,6 +122,9 @@ static int16_t q_block[64];
 #define STRIP_LINES 8
 static uint8_t strip_buf[STRIP_MAX_WIDTH * STRIP_LINES * 2] __attribute__((aligned(4)));
 
+// Static Exif APP1 Payload Buffer (512 bytes in BSS, zero heap/stack overhead)
+static uint8_t exif_payload[512] __attribute__((aligned(4)));
+
 // Fast Gamma / White Balance LUTs for Raw Debayering (3 KB in BSS)
 static uint8_t lut_r[1024];
 static uint8_t lut_g[1024];
@@ -353,7 +356,25 @@ static void encode_block(int16_t* block, int16_t* prev_dc, const huff_code_t* dc
     }
 }
 
-static inline void apply_film_stock(uint32_t preset, uint8_t* py0, uint8_t* py1, uint8_t* pu, uint8_t* pv)
+// Fast, Zero-Allocation 16-bit Galois LFSR for Analog Film Grain Injection
+static uint32_t grain_lfsr = 0xACE1u;
+
+static inline int32_t next_film_grain(int strength)
+{
+    if (strength <= 0) return 0;
+    // Galois LFSR 16-bit polynomial: taps at 16, 14, 13, 11 (0xB400)
+    grain_lfsr = (grain_lfsr >> 1) ^ (-(grain_lfsr & 1u) & 0xB400u);
+    int32_t noise = (int32_t)(grain_lfsr & 0x0F) - 7; // range -7 to +8
+    switch (strength)
+    {
+        case 1: return (noise >> 2); // subtle (+- 2)
+        case 2: return (noise >> 1); // medium (+- 4)
+        case 3: return noise;        // heavy (+- 8)
+        default: return 0;
+    }
+}
+
+static inline void apply_film_stock(uint32_t preset, uint8_t* py0, uint8_t* py1, uint8_t* pu, uint8_t* pv, int grain_strength)
 {
     int32_t y0 = *py0;
     int32_t y1 = *py1;
@@ -401,15 +422,21 @@ static inline void apply_film_stock(uint32_t preset, uint8_t* py0, uint8_t* py1,
             break;
     }
 
+    if (grain_strength > 0)
+    {
+        y0 = clamp_u8(y0 + next_film_grain(grain_strength));
+        y1 = clamp_u8(y1 + next_film_grain(grain_strength));
+    }
+
     *py0 = (uint8_t)y0;
     *py1 = (uint8_t)y1;
     *pu  = (uint8_t)u;
     *pv  = (uint8_t)v;
 }
 
-void apply_film_simulation_yuv422(uint8_t* uyvy_data, int width, int height, int pitch, int film_preset)
+void apply_film_simulation_yuv422(uint8_t* uyvy_data, int width, int height, int pitch, int film_preset, int grain_strength)
 {
-    if (!uyvy_data || film_preset <= 0 || film_preset > 5) return;
+    if (!uyvy_data || (film_preset <= 0 && grain_strength <= 0)) return;
 
     for (int y = 0; y < height; y++)
     {
@@ -423,7 +450,7 @@ void apply_film_simulation_yuv422(uint8_t* uyvy_data, int width, int height, int
             uint8_t v  = (uint8_t)((val >> 16) & 0xFF);
             uint8_t y1 = (uint8_t)((val >> 24) & 0xFF);
 
-            apply_film_stock((uint32_t)film_preset, &y0, &y1, &u, &v);
+            apply_film_stock((uint32_t)film_preset, &y0, &y1, &u, &v, grain_strength);
 
             row[i] = (uint32_t)u | ((uint32_t)y0 << 8) | ((uint32_t)v << 16) | ((uint32_t)y1 << 24);
         }
@@ -614,7 +641,151 @@ static void encode_mcu_row(
     }
 }
 
-static void write_jpeg_headers(int width, int height, int quality)
+static inline void put_u16_le(uint8_t* buf, int offset, uint16_t val) {
+    buf[offset] = (uint8_t)(val & 0xFF);
+    buf[offset + 1] = (uint8_t)((val >> 8) & 0xFF);
+}
+
+static inline void put_u32_le(uint8_t* buf, int offset, uint32_t val) {
+    buf[offset] = (uint8_t)(val & 0xFF);
+    buf[offset + 1] = (uint8_t)((val >> 8) & 0xFF);
+    buf[offset + 2] = (uint8_t)((val >> 16) & 0xFF);
+    buf[offset + 3] = (uint8_t)((val >> 24) & 0xFF);
+}
+
+static inline void put_ifd_entry(uint8_t* buf, int offset, uint16_t tag, uint16_t type, uint32_t count, uint32_t val_or_offset) {
+    put_u16_le(buf, offset + 0, tag);
+    put_u16_le(buf, offset + 2, type);
+    put_u32_le(buf, offset + 4, count);
+    put_u32_le(buf, offset + 8, val_or_offset);
+}
+
+static void write_jpeg_exif(const struct jpeg_exif_tags* exif) {
+    if (!exif) return;
+
+    memset(exif_payload, 0, sizeof(exif_payload));
+
+    // 1. TIFF Header (8 bytes at offset 0)
+    exif_payload[0] = 'I';
+    exif_payload[1] = 'I';
+    put_u16_le(exif_payload, 2, 0x002A);
+    put_u32_le(exif_payload, 4, 8); // Offset to IFD0
+
+    // Fixed Structure Offsets
+    int ifd0_offset = 8;
+    int subifd_offset = 8 + 2 + 6 * 12 + 4; // 86
+    int data_offset = subifd_offset + 2 + 6 * 12 + 4; // 164
+
+    // Strings & Content
+    const char* s_make = "Canon";
+    const char* s_model = (exif->model && exif->model[0]) ? exif->model : "Canon EOS 5D Mark II";
+    const char* s_soft = "Magic Lantern Zero 5D2";
+
+    char s_date[24];
+    if (exif->year > 2000) {
+        snprintf(s_date, sizeof(s_date), "%04d:%02d:%02d %02d:%02d:%02d",
+                 exif->year, exif->month, exif->day, exif->hour, exif->min, exif->sec);
+    } else {
+        snprintf(s_date, sizeof(s_date), "2026:10:11 08:30:00");
+    }
+
+    char s_desc[48];
+    if (exif->film_name && exif->film_name[0]) {
+        snprintf(s_desc, sizeof(s_desc), "%s Film Simulation", exif->film_name);
+    } else {
+        snprintf(s_desc, sizeof(s_desc), "Silent Picture JPEG");
+    }
+
+    char s_comment[64];
+    memcpy(s_comment, "ASCII\0\0\0", 8);
+    int txt_len = snprintf(s_comment + 8, sizeof(s_comment) - 8, "Film: %s",
+                           exif->film_name ? exif->film_name : "Standard");
+    int len_make = strlen(s_make) + 1;
+    int len_model = strlen(s_model) + 1;
+    int len_soft = strlen(s_soft) + 1;
+    int len_date = strlen(s_date) + 1;
+    int len_desc = strlen(s_desc) + 1;
+    int len_comm = 8 + txt_len + 1;
+
+    int off_make = data_offset;
+    int off_model = off_make + len_make;
+    int off_soft = off_model + len_model;
+    int off_date = off_soft + len_soft;
+    int off_desc = off_date + len_date;
+    int off_exp = (off_desc + len_desc + 3) & ~3;
+    int off_fn = off_exp + 8;
+    int off_fl = off_fn + 8;
+    int off_comm = off_fl + 8;
+
+    // 2. IFD0 (6 entries at ifd0_offset)
+    put_u16_le(exif_payload, ifd0_offset, 6);
+    put_ifd_entry(exif_payload, ifd0_offset + 2 + 0 * 12, 0x010F, 2, len_make, off_make);
+    put_ifd_entry(exif_payload, ifd0_offset + 2 + 1 * 12, 0x0110, 2, len_model, off_model);
+    put_ifd_entry(exif_payload, ifd0_offset + 2 + 2 * 12, 0x0131, 2, len_soft, off_soft);
+    put_ifd_entry(exif_payload, ifd0_offset + 2 + 3 * 12, 0x0132, 2, len_date, off_date);
+    put_ifd_entry(exif_payload, ifd0_offset + 2 + 4 * 12, 0x010E, 2, len_desc, off_desc);
+    put_ifd_entry(exif_payload, ifd0_offset + 2 + 5 * 12, 0x8769, 4, 1, subifd_offset);
+    put_u32_le(exif_payload, ifd0_offset + 2 + 6 * 12, 0); // Next IFD = 0
+
+    // 3. Exif SubIFD (6 entries at subifd_offset)
+    int iso = exif->iso ? exif->iso : 100;
+    int s_num = exif->shutter_num ? exif->shutter_num : 1;
+    int s_den = exif->shutter_den ? exif->shutter_den : 50;
+    int f_num = exif->aperture_x10 ? exif->aperture_x10 : 28;
+    int f_den = 10;
+    int fl_num = exif->focal_len ? exif->focal_len : 50;
+    int fl_den = 1;
+
+    put_u16_le(exif_payload, subifd_offset, 6);
+    put_ifd_entry(exif_payload, subifd_offset + 2 + 0 * 12, 0x829A, 5, 1, off_exp);
+    put_ifd_entry(exif_payload, subifd_offset + 2 + 1 * 12, 0x829D, 5, 1, off_fn);
+    put_ifd_entry(exif_payload, subifd_offset + 2 + 2 * 12, 0x8827, 3, 1, (uint32_t)iso);
+    put_ifd_entry(exif_payload, subifd_offset + 2 + 3 * 12, 0x9003, 2, len_date, off_date);
+    put_ifd_entry(exif_payload, subifd_offset + 2 + 4 * 12, 0x920A, 5, 1, off_fl);
+    put_ifd_entry(exif_payload, subifd_offset + 2 + 5 * 12, 0x9286, 7, len_comm, off_comm);
+    put_u32_le(exif_payload, subifd_offset + 2 + 6 * 12, 0); // Next IFD = 0
+
+    // 4. Data Area
+    memcpy(exif_payload + off_make, s_make, len_make);
+    memcpy(exif_payload + off_model, s_model, len_model);
+    memcpy(exif_payload + off_soft, s_soft, len_soft);
+    memcpy(exif_payload + off_date, s_date, len_date);
+    memcpy(exif_payload + off_desc, s_desc, len_desc);
+
+    put_u32_le(exif_payload, off_exp, s_num);
+    put_u32_le(exif_payload, off_exp + 4, s_den);
+
+    put_u32_le(exif_payload, off_fn, f_num);
+    put_u32_le(exif_payload, off_fn + 4, f_den);
+
+    put_u32_le(exif_payload, off_fl, fl_num);
+    put_u32_le(exif_payload, off_fl + 4, fl_den);
+
+    memcpy(exif_payload + off_comm, s_comment, len_comm);
+
+    int total_tiff_len = off_comm + len_comm;
+    if (total_tiff_len > (int)sizeof(exif_payload)) {
+        total_tiff_len = sizeof(exif_payload);
+    }
+
+    // 5. Emit APP1 Marker & Length
+    write_byte(0xFF);
+    write_byte(0xE1);
+
+    int app1_len = total_tiff_len + 6 + 2;
+    write_byte((uint8_t)(app1_len >> 8));
+    write_byte((uint8_t)(app1_len & 0xFF));
+
+    // "Exif\0\0"
+    write_byte('E'); write_byte('x'); write_byte('i'); write_byte('f');
+    write_byte(0x00); write_byte(0x00);
+
+    for (int i = 0; i < total_tiff_len; i++) {
+        write_byte(exif_payload[i]);
+    }
+}
+
+static void write_jpeg_headers(int width, int height, int quality, const struct jpeg_exif_tags* exif)
 {
     init_tables(quality);
     out_buf_pos = 0;
@@ -623,6 +794,11 @@ static void write_jpeg_headers(int width, int height, int quality)
 
     // 1. SOI (Start of Image)
     write_byte(0xFF); write_byte(0xD8);
+
+    // Optional APP1 (EXIF Header)
+    if (exif) {
+        write_jpeg_exif(exif);
+    }
 
     // 2. APP0 (JFIF Header)
     write_byte(0xFF); write_byte(0xE0);
@@ -699,7 +875,15 @@ static void write_jpeg_trailer(void)
     }
 }
 
-int encode_yuv422_to_jpeg(const uint8_t* uyvy_data, int width, int height, int pitch, int quality, const char* out_path) {
+int encode_yuv422_to_jpeg(
+    const uint8_t* uyvy_data,
+    int width,
+    int height,
+    int pitch,
+    int quality,
+    const struct jpeg_exif_tags* exif,
+    const char* out_path
+) {
     if (!uyvy_data || width <= 0 || height <= 0 || !out_path) {
         printf("[JPEG_ENC] Invalid args: uyvy=%p w=%d h=%d path=%s\n", uyvy_data, width, height, out_path ? out_path : "NULL");
         return 0;
@@ -710,7 +894,7 @@ int encode_yuv422_to_jpeg(const uint8_t* uyvy_data, int width, int height, int p
         return 0;
     }
 
-    write_jpeg_headers(width, height, quality);
+    write_jpeg_headers(width, height, quality, exif);
 
     int16_t prev_dc_y = 0;
     int16_t prev_dc_u = 0;
@@ -732,8 +916,13 @@ int encode_yuv422_to_jpeg(const uint8_t* uyvy_data, int width, int height, int p
     return 1;
 }
 
-int encode_raw_fullres_to_jpeg(const struct raw_info* raw, int quality, int film_preset, const char* out_path)
-{
+int encode_raw_fullres_to_jpeg(
+    const struct raw_info* raw,
+    int quality,
+    int film_preset,
+    const struct jpeg_exif_tags* exif,
+    const char* out_path
+) {
     if (!raw || !raw->buffer || !out_path) {
         printf("[JPEG_FULLRES] Invalid args: raw=%p path=%s\n", raw, out_path ? out_path : "NULL");
         return 0;
@@ -753,7 +942,7 @@ int encode_raw_fullres_to_jpeg(const struct raw_info* raw, int quality, int film
     }
 
     init_raw_gamma_luts(raw->black_level, raw->white_level);
-    write_jpeg_headers(width, height, quality);
+    write_jpeg_headers(width, height, quality, exif);
 
     int16_t prev_dc_y = 0;
     int16_t prev_dc_u = 0;
@@ -762,13 +951,14 @@ int encode_raw_fullres_to_jpeg(const struct raw_info* raw, int quality, int film
     int mcu_h = 8;
     int mcus_y = (height + mcu_h - 1) / mcu_h;
     int strip_pitch = width * 2;
+    int grain = exif ? exif->grain_strength : 0;
 
     for (int my = 0; my < mcus_y; my++) {
         int py0 = my * mcu_h;
         debayer_raw_8lines(raw, py0, strip_buf, width, strip_pitch);
 
-        if (film_preset > 0 && film_preset <= 5) {
-            apply_film_simulation_yuv422(strip_buf, width, 8, strip_pitch, film_preset);
+        if ((film_preset > 0 && film_preset <= 5) || grain > 0) {
+            apply_film_simulation_yuv422(strip_buf, width, 8, strip_pitch, film_preset, grain);
         }
 
         encode_mcu_row(strip_buf, width, strip_pitch, 8, &prev_dc_y, &prev_dc_u, &prev_dc_v);
