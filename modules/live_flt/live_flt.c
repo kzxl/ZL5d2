@@ -607,7 +607,7 @@ static volatile int fast_af_target_y = 240;
 
 static void draw_af_reticle(
     uint32_t * dst, int dwords_per_row, int dwords_visible,
-    int cx, int cy, int hw, int hh, int arm, uint32_t col
+    int cx, int cy, int hw, int hh, int arm, int height, uint32_t col
 )
 {
     int x0 = cx - hw;
@@ -620,6 +620,7 @@ static void draw_af_reticle(
     for (int r = 0; r < 2; r++)
     {
         int y = rows[r];
+        if (y < 0 || y >= height) continue;
         uint32_t * row = dst + y * dwords_per_row;
         // Left segment
         int p_start_l = (x0 > 0) ? (x0 / 2) : 0;
@@ -644,6 +645,7 @@ static void draw_af_reticle(
     // Top-left & top-right vertical segments
     for (int y = y0; y <= y0 + arm; y++)
     {
+        if (y < 0 || y >= height) continue;
         uint32_t * row = dst + y * dwords_per_row;
         if (p_left >= 0 && p_left < dwords_visible) row[p_left] = col;
         if (p_right >= 0 && p_right < dwords_visible) row[p_right] = col;
@@ -652,6 +654,7 @@ static void draw_af_reticle(
     // Bottom-left & bottom-right vertical segments
     for (int y = y1 - arm; y <= y1; y++)
     {
+        if (y < 0 || y >= height) continue;
         uint32_t * row = dst + y * dwords_per_row;
         if (p_left >= 0 && p_left < dwords_visible) row[p_left] = col;
         if (p_right >= 0 && p_right < dwords_visible) row[p_right] = col;
@@ -701,7 +704,7 @@ static void apply_fast_af_frame(
             col = 0x4C54FF4C; // Red (Failed / Inconclusive)
         }
 
-        draw_af_reticle(dst, dwords_per_row, dwords_visible, af_cx, af_cy, 40, 24, 10, col);
+        draw_af_reticle(dst, dwords_per_row, dwords_visible, af_cx, af_cy, 40, 24, 10, height, col);
     }
 }
 
@@ -720,11 +723,20 @@ static void fast_af_task(void * priv)
 
     uint32_t start_time = get_ms_clock();
 
+    // 1. Initial frame sync before motor moves
+    uint32_t prev_seq = fast_af_frame_seq;
+    for (int w = 0; w < 6; w++)
+    {
+        if (fast_af_frame_seq != prev_seq) break;
+        msleep(10);
+        if (fast_af_cancel || !lv || is_manual_focus() || gui_menu_shown()) break;
+    }
+
     while (1)
     {
-        if (fast_af_cancel || !lv || is_manual_focus())
+        if (fast_af_cancel || !lv || is_manual_focus() || gui_menu_shown() || lens_info.job_state != 0)
         {
-            fast_af_status = 3;
+            fast_af_status = 3; // Cancelled
             fast_af_lock_time = get_ms_clock();
             break;
         }
@@ -736,28 +748,27 @@ static void fast_af_task(void * priv)
             break;
         }
 
-        // Synchronize with fresh LiveView frame (up to 60ms)
-        uint32_t prev_seq = fast_af_frame_seq;
-        for (int w = 0; w < 6; w++)
-        {
-            if (fast_af_frame_seq != prev_seq) break;
-            msleep(10);
-            if (fast_af_cancel || !lv || is_manual_focus()) break;
-        }
-
         uint32_t q = fast_af_latest_q;
         int motor_step = 0;
         int phase = 0;
         int action = rust_fast_af_step(q, &motor_step, &phase);
 
-        if (action == 1 /* STEP_MOTOR */)
+        // Always execute any pending motor movement
+        if (motor_step != 0)
         {
-            if (motor_step != 0)
+            lens_focus(1, motor_step, 1, 0);
+
+            // Wait 2 frames (~60ms) after motor movement so sensor captures a sharp, static scene
+            uint32_t motor_stop_seq = fast_af_frame_seq;
+            for (int w = 0; w < 8; w++)
             {
-                lens_focus(1, motor_step, 1, 0);
+                if (fast_af_frame_seq >= motor_stop_seq + 2) break;
+                msleep(10);
+                if (fast_af_cancel || !lv || is_manual_focus() || gui_menu_shown()) break;
             }
         }
-        else if (action == 2 /* LOCK_SUCCESS */)
+
+        if (action == 2 /* LOCK_SUCCESS */)
         {
             fast_af_status = 2; // Locked!
             fast_af_lock_time = get_ms_clock();
@@ -776,7 +787,7 @@ static void fast_af_task(void * priv)
             fast_af_lock_time = get_ms_clock();
             break;
         }
-        else
+        else if (motor_step == 0)
         {
             msleep(20);
         }
@@ -828,7 +839,14 @@ static unsigned int live_flt_keypress_cbr(unsigned int key)
     {
         if (key == MODULE_KEY_PRESS_SET)
         {
-            fast_af_trigger();
+            if (fast_af_running)
+            {
+                fast_af_cancel = 1;
+            }
+            else
+            {
+                fast_af_trigger();
+            }
             return 0; // Consume event
         }
     }
@@ -836,7 +854,14 @@ static unsigned int live_flt_keypress_cbr(unsigned int key)
     {
         if (key == MODULE_KEY_JOY_CENTER)
         {
-            fast_af_trigger();
+            if (fast_af_running)
+            {
+                fast_af_cancel = 1;
+            }
+            else
+            {
+                fast_af_trigger();
+            }
             return 0; // Consume event
         }
     }
