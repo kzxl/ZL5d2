@@ -1,13 +1,40 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
+#[cfg(not(test))]
 use core::panic::PanicInfo;
 
+/// Required by `no_std`. Unreachable in the release object: the Makefile build is checked to
+/// contain no undefined symbols, and the hot path has no panic sites (no indexing, no `/`,
+/// shifts clamped). Unit tests run on the host with `std` instead.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-#[no_mangle]
-pub extern "C" fn __aeabi_unwind_cpp_pr0() {}
+/// Restoring shift-subtract division (no libcall).
+///
+/// The ARM946E-S has no hardware divider, so `/` lowers to a `BL __aeabi_uidiv` into core.
+/// Rust objects are not built with long calls, and a module loaded more than 32 MB away from
+/// core would overflow that branch. Division by zero returns 0.
+#[inline(never)]
+fn div_u32(n: u32, d: u32) -> u32 {
+    if d == 0 {
+        return 0;
+    }
+    let mut quotient = 0u32;
+    let mut remainder = 0u64; /* 64-bit: (remainder << 1) cannot drop a bit when d > 2^31 */
+    let divisor = d as u64;
+    let mut bit = 32;
+    while bit > 0 {
+        bit -= 1;
+        remainder = (remainder << 1) | ((n >> bit) & 1) as u64;
+        if remainder >= divisor {
+            remainder -= divisor;
+            quotient |= 1 << bit;
+        }
+    }
+    quotient
+}
 
 #[inline(always)]
 fn clamp_u8(val: i32) -> u8 {
@@ -171,6 +198,10 @@ fn apply_cine_mask(
     (y0, y1, u, v)
 }
 
+/// Computes the visible (uncropped) rectangle for a cine aspect-ratio mask.
+///
+/// # Safety
+/// Each output pointer must be either null (skipped) or valid for a write of one `i32`.
 #[no_mangle]
 pub unsafe extern "C" fn rust_flt_get_crop_bounds(
     ratio: u32,
@@ -222,6 +253,7 @@ pub unsafe extern "C" fn rust_flt_get_crop_bounds(
         _ => {}
     }
 
+    // SAFETY: each pointer is checked for null; non-null pointers are valid per the contract above.
     if !ymin.is_null() { *ymin = ym; }
     if !ymax.is_null() { *ymax = y_max; }
     if !xmin.is_null() { *xmin = xm; }
@@ -291,6 +323,16 @@ fn apply_recipe(
     (y0, y1, u, v)
 }
 
+/// Grades one LiveView UYVY row: cine mask, graduated/plain ND preview, film stock and recipe.
+///
+/// # Safety
+/// - `row_src` must be valid for reads of `dwords_visible` `u32` values (one UYVY pixel pair each)
+///   and 4-byte aligned.
+/// - `row_dst` must be valid for writes of `dwords_visible` `u32` values and 4-byte aligned.
+/// - `row_src` and `row_dst` must either be identical (in-place) or not overlap: each element is
+///   read once before its own slot is written, never after.
+///
+/// Null pointers or `dwords_visible <= 0` make the call a no-op. Shift amounts are clamped to 0..7.
 #[no_mangle]
 pub unsafe extern "C" fn rust_flt_process_row(
     row_src: *const u32,
@@ -317,10 +359,30 @@ pub unsafe extern "C" fn rust_flt_process_row(
     rec_wb_ab: i32,
     rec_wb_gm: i32,
 ) {
+    if row_src.is_null() || row_dst.is_null() {
+        return;
+    }
+
     let row_outside_v = (has_crop != 0) && (y < ymin || y >= ymax);
     let row_border_v  = (has_crop != 0) && (y == ymin || y == ymax - 1);
 
+    // Row-invariant ND parameters, hoisted out of the per-pixel loop.
+    let gnd_s = gnd_shift.clamp(0, 7) as u32;
+    let nd_s = nd_shift.clamp(0, 7) as u32;
+    let gnd_full = gnd_active != 0 && y < gnd_y_start;
+    let gnd_ramp = gnd_active != 0 && !gnd_full && y <= gnd_y_end;
+    let gnd_factor: i32 = if gnd_ramp {
+        // y is in [gnd_y_start, gnd_y_end] here, so both operands are non-negative and denom >= 1.
+        let factor_min = 256 >> gnd_s;
+        let denom = (gnd_y_end - gnd_y_start + 1).max(1) as u32;
+        let numer = ((256 - factor_min) * (y - gnd_y_start)) as u32;
+        (factor_min + div_u32(numer, denom) as i32).min(256)
+    } else {
+        256
+    };
+
     for x in 0..dwords_visible {
+        // SAFETY: 0 <= x < dwords_visible and row_src is valid for that many reads (contract).
         let p = *row_src.offset(x as isize);
         let mut u  = (p & 0xFF) as u8;
         let mut y0 = ((p >> 8) & 0xFF) as u8;
@@ -341,20 +403,16 @@ pub unsafe extern "C" fn rust_flt_process_row(
             v  = res.3;
         } else {
             if gnd_active != 0 {
-                if y < gnd_y_start {
-                    y0 >>= gnd_shift;
-                    y1 >>= gnd_shift;
-                } else if y <= gnd_y_end {
-                    let factor_min = 256 >> gnd_shift;
-                    let denom = (gnd_y_end - gnd_y_start + 1).max(1);
-                    let factor = factor_min + ((256 - factor_min) * (y - gnd_y_start)) / denom;
-                    let factor_clamped = if factor > 256 { 256 } else { factor };
-                    y0 = ((y0 as i32 * factor_clamped) >> 8) as u8;
-                    y1 = ((y1 as i32 * factor_clamped) >> 8) as u8;
+                if gnd_full {
+                    y0 >>= gnd_s;
+                    y1 >>= gnd_s;
+                } else if gnd_ramp {
+                    y0 = ((y0 as i32 * gnd_factor) >> 8) as u8;
+                    y1 = ((y1 as i32 * gnd_factor) >> 8) as u8;
                 }
             } else if nd_active != 0 {
-                y0 >>= nd_shift;
-                y1 >>= nd_shift;
+                y0 >>= nd_s;
+                y1 >>= nd_s;
             } else {
                 if film_preset > 0 && film_preset <= 5 {
                     let res = apply_film_stock(film_preset, y0, y1, u, v);
@@ -374,6 +432,84 @@ pub unsafe extern "C" fn rust_flt_process_row(
         }
 
         let out_pixel = (u as u32) | ((y0 as u32) << 8) | ((v as u32) << 16) | ((y1 as u32) << 24);
+        // SAFETY: same index bound as the read; row_dst is valid for dwords_visible writes (contract).
         *row_dst.offset(x as isize) = out_pixel;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Original per-pixel GND gradient formula, kept as the reference oracle.
+    fn reference_gnd(y0: u8, y: i32, shift: i32, start: i32, end: i32) -> u8 {
+        let factor_min = 256 >> shift;
+        let denom = (end - start + 1).max(1);
+        let factor = factor_min + ((256 - factor_min) * (y - start)) / denom;
+        let factor_clamped = if factor > 256 { 256 } else { factor };
+        ((y0 as i32 * factor_clamped) >> 8) as u8
+    }
+
+    fn run_row(src: &[u32], y: i32, gnd: (i32, i32, i32, i32), nd: (i32, i32)) -> [u32; 8] {
+        let mut dst = [0u32; 8];
+        unsafe {
+            rust_flt_process_row(
+                src.as_ptr(), dst.as_mut_ptr(), 8, y, 0, 480, 0, 720, 0, 0, 0,
+                gnd.0, gnd.1, gnd.2, gnd.3, nd.0, nd.1, 0, 0, 0, 0, 0, 0,
+            );
+        }
+        dst
+    }
+
+    #[test]
+    fn div_u32_matches_hardware_division() {
+        for n in [0u32, 1, 7, 255, 256, 65_535, 65_280, 1 << 20, u32::MAX] {
+            for d in [1u32, 2, 3, 7, 13, 255, 256, 480, 65_535, u32::MAX] {
+                assert_eq!(div_u32(n, d), n / d, "{} / {}", n, d);
+            }
+        }
+        assert_eq!(div_u32(123, 0), 0, "division by zero is defined as 0");
+    }
+
+    #[test]
+    fn gnd_gradient_matches_reference() {
+        let src: [u32; 8] = [0x80FF_80FF, 0x8010_8020, 0x80C8_8064, 0, 0xFFFF_FFFF, 0x1234_5678, 0x80EB_80EB, 0x8001_8002];
+        for shift in 1..=4 {
+            for (start, end) in [(100, 300), (0, 479), (200, 200), (50, 51)] {
+                for y in start..=end {
+                    let out = run_row(&src, y, (1, shift, start, end), (0, 0));
+                    for (i, p) in src.iter().enumerate() {
+                        let y0 = ((p >> 8) & 0xFF) as u8;
+                        let y1 = ((p >> 24) & 0xFF) as u8;
+                        assert_eq!(((out[i] >> 8) & 0xFF) as u8, reference_gnd(y0, y, shift, start, end));
+                        assert_eq!(((out[i] >> 24) & 0xFF) as u8, reference_gnd(y1, y, shift, start, end));
+                        assert_eq!(out[i] & 0x00FF_00FF, p & 0x00FF_00FF, "chroma untouched");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_range_shifts_do_not_panic() {
+        let src = [0xFFFF_FFFFu32; 8];
+        for s in [-5, -1, 0, 7, 8, 9, 31, 1000] {
+            let _ = run_row(&src, 10, (1, s, 100, 200), (0, 0));
+            let _ = run_row(&src, 150, (1, s, 100, 200), (0, 0));
+            let _ = run_row(&src, 10, (0, 0, 0, 0), (1, s));
+        }
+        let out = run_row(&src, 10, (0, 0, 0, 0), (1, 100));
+        assert_eq!((out[0] >> 8) & 0xFF, 0xFF >> 7, "nd shift is clamped to 7");
+    }
+
+    #[test]
+    fn crop_bounds_accept_null_outputs() {
+        unsafe {
+            rust_flt_get_crop_bounds(2, 720, 480, core::ptr::null_mut(), core::ptr::null_mut(),
+                                     core::ptr::null_mut(), core::ptr::null_mut());
+        }
+        let (mut a, mut b, mut c, mut d) = (0, 0, 0, 0);
+        unsafe { rust_flt_get_crop_bounds(2, 720, 480, &mut a, &mut b, &mut c, &mut d) };
+        assert_eq!((a, b, c, d), (83, 397, 0, 720));
     }
 }

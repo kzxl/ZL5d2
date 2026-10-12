@@ -14,25 +14,36 @@ pub struct Semaphore {
     _private: [u8; 0],
 }
 
+/// DryOS task control block, mirrors `struct task` in `src/tasks.h` (CONFIG_TASK_STRUCT_V1, size 0x50).
 #[repr(C)]
 pub struct Task {
-    pub prev_task: *mut Task,
-    pub next_task: *mut Task,
-    pub run_prio: u32,
-    pub entry: *mut c_void,
-    pub arg: u32,
-    pub wait_obj_id: u32,
-    _pad1: [u32; 1],
-    pub stack_start_addr: u32,
-    pub stack_size: u32,
-    pub name: *const u8,
-    _pad2: [u32; 3],
-    pub self_ptr: *mut Task,
-    _pad3: [u32; 3],
-    pub task_id: u32,
-    _pad4: [u8; 7],
-    pub context: *mut c_void,
+    pub prev_task: *mut Task,     // 0x00
+    pub next_task: *mut Task,     // 0x04
+    pub run_prio: u32,            // 0x08
+    pub entry: *mut c_void,       // 0x0c
+    pub arg: u32,                 // 0x10
+    pub wait_obj_id: u32,         // 0x14
+    _pad1: [u32; 1],              // 0x18
+    pub stack_start_addr: u32,    // 0x1c
+    pub stack_size: u32,          // 0x20
+    pub name: *const u8,          // 0x24
+    _pad2: [u32; 2],              // 0x28
+    pub self_ptr: *mut Task,      // 0x30
+    _pad3: [u32; 3],              // 0x34
+    pub task_id: u32,             // 0x40
+    _pad4: [u8; 8],               // 0x44 (state / yield / sleep bytes)
+    pub context: *mut c_void,     // 0x4c
 }
+
+// Layout is only meaningful on the 32-bit camera target.
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    assert!(core::mem::size_of::<Task>() == 0x50);
+    assert!(core::mem::offset_of!(Task, name) == 0x24);
+    assert!(core::mem::offset_of!(Task, self_ptr) == 0x30);
+    assert!(core::mem::offset_of!(Task, task_id) == 0x40);
+    assert!(core::mem::offset_of!(Task, context) == 0x4c);
+};
 
 extern "C" {
     // Task Management

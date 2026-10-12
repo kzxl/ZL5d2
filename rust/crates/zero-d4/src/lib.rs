@@ -17,6 +17,9 @@ critical_section::set_impl!(D4CriticalSection);
 
 #[cfg(target_arch = "arm")]
 unsafe impl critical_section::Impl for D4CriticalSection {
+    // `nomem` must NOT be used here: these asm blocks double as compiler memory barriers, so loads and
+    // stores inside the critical section cannot be reordered across the IRQ disable/enable. The
+    // ARM946E-S is single-core, so no hardware barrier (and no `dmb`, absent on ARMv5) is required.
     unsafe fn acquire() -> critical_section::RawRestoreState {
         let old_cpsr: u32;
         core::arch::asm!(
@@ -25,7 +28,7 @@ unsafe impl critical_section::Impl for D4CriticalSection {
             "msr CPSR_c, r1",
             out(reg) old_cpsr,
             out("r1") _,
-            options(nomem, nostack)
+            options(nostack)
         );
         old_cpsr
     }
@@ -39,7 +42,7 @@ unsafe impl critical_section::Impl for D4CriticalSection {
             "msr CPSR_c, r1",
             in(reg) restore_state,
             out("r1") _,
-            options(nomem, nostack)
+            options(nostack)
         );
     }
 }

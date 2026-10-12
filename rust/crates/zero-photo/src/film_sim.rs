@@ -5,17 +5,19 @@
 //! - Chroma matrix transformation (saturation scaling, hue rotation, split-toning)
 //! - Zero memory allocations in frame rendering loops.
 
+/// Film stock identifiers. Values 1..5 are shared with the C side (`struct film_recipe::base_stock`
+/// in modules/silent/jpeg_enc.h, `live_flt.film_sim`, rust_flt) and must stay in sync with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum FilmStock {
     Off = 0,
     KodakPortra400 = 1,
     FujiVelvia50 = 2,
-    KodakKodachrome64 = 3,
-    FujiClassicChrome = 4,
-    CineStill800T = 5,
-    IlfordHp5 = 6,
-    KodakTriX = 7,
+    CineStill800T = 3,
+    KodakTriX = 4,
+    FujiClassicChrome = 5,
+    KodakKodachrome64 = 6,
+    IlfordHp5 = 7,
     SepiaVintage = 8,
 }
 
@@ -149,10 +151,15 @@ impl FilmStock {
 }
 
 // ------------------------------------------------------------------------
-// C ABI Export for live_flt and Magic Lantern Core
+// C ABI export (experimental: not linked into any module, see rust/README.md)
 // ------------------------------------------------------------------------
+/// Applies a film stock in place to an interleaved UYVY buffer.
+///
+/// # Safety
+/// `buf` must be null (no-op) or valid for reads and writes of `(num_pixels / 2) * 4` bytes, and no
+/// other code (including DMA) may access that range for the duration of the call.
 #[no_mangle]
-pub extern "C" fn zero_film_sim_process_yuv422(
+pub unsafe extern "C" fn zero_film_sim_process_yuv422(
     stock_id: u32,
     buf: *mut u8,
     num_pixels: usize,
@@ -164,11 +171,11 @@ pub extern "C" fn zero_film_sim_process_yuv422(
     let stock = match stock_id {
         1 => FilmStock::KodakPortra400,
         2 => FilmStock::FujiVelvia50,
-        3 => FilmStock::KodakKodachrome64,
-        4 => FilmStock::FujiClassicChrome,
-        5 => FilmStock::CineStill800T,
-        6 => FilmStock::IlfordHp5,
-        7 => FilmStock::KodakTriX,
+        3 => FilmStock::CineStill800T,
+        4 => FilmStock::KodakTriX,
+        5 => FilmStock::FujiClassicChrome,
+        6 => FilmStock::KodakKodachrome64,
+        7 => FilmStock::IlfordHp5,
         8 => FilmStock::SepiaVintage,
         _ => return,
     };
@@ -176,17 +183,12 @@ pub extern "C" fn zero_film_sim_process_yuv422(
     let profile = stock.profile();
     let num_pairs = num_pixels / 2;
 
+    // SAFETY: the caller guarantees `buf` covers num_pairs * 4 bytes with exclusive access.
+    let pixels = core::slice::from_raw_parts_mut(buf, num_pairs * 4);
     // YUV422 interleaved in Canon VRAM is: [U0, Y0, V0, Y1] (4 bytes per 2 pixels)
-    unsafe {
-        let mut ptr = buf;
-        for _ in 0..num_pairs {
-            let u = &mut *ptr;
-            let y0 = &mut *ptr.add(1);
-            let v = &mut *ptr.add(2);
-            let y1 = &mut *ptr.add(3);
-
+    for pair in pixels.chunks_exact_mut(4) {
+        if let [u, y0, v, y1] = pair {
             stock.apply_yuv422_pair(&profile, y0, y1, u, v);
-            ptr = ptr.add(4);
         }
     }
 }
