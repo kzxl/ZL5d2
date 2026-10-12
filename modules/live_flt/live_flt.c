@@ -61,6 +61,8 @@ static CONFIG_INT("live_flt.rec_sat",        live_flt_rec_sat, 0);      /* -2 ..
 static CONFIG_INT("live_flt.rec_wb_ab",      live_flt_rec_wb_ab, 0);    /* -9 .. +9 */
 static CONFIG_INT("live_flt.rec_wb_gm",      live_flt_rec_wb_gm, 0);    /* -9 .. +9 */
 static CONFIG_INT("live_flt.rec_grain",      live_flt_rec_grain, 0);    /* 0..3 */
+static CONFIG_INT("live_flt.rec_bw_filter",  live_flt_rec_bw_filter, 0); /* 0: None, 1: Yellow, 2: Orange, 3: Red, 4: Green */
+static CONFIG_INT("live_flt.rec_halation",   live_flt_rec_halation, 0);  /* 0: Off, 1: Subtle, 2: Strong */
 
 static const char * film_sim_choices[] = {
     "OFF",
@@ -95,6 +97,20 @@ static const char * grain_choices[] = {
     "Subtle",
     "Medium",
     "Heavy"
+};
+
+static const char * bw_filter_choices[] = {
+    "None (Rec.601)",
+    "Yellow #8",
+    "Orange #16",
+    "Red #25A",
+    "Green #11"
+};
+
+static const char * halation_choices[] = {
+    "Off",
+    "Subtle",
+    "Strong"
 };
 
 static const char * cine_ratio_choices[] = {
@@ -151,13 +167,18 @@ extern void rust_flt_process_row(
     int rec_shadow,
     int rec_saturation,
     int rec_wb_ab,
-    int rec_wb_gm
+    int rec_wb_gm,
+    int bw_filter,
+    int halation
 );
 
 static void get_effective_recipe_params(
-    int * base, int * high, int * shadow, int * sat, int * wb_ab, int * wb_gm, int * grain, const char ** name
+    int * base, int * high, int * shadow, int * sat, int * wb_ab, int * wb_gm, int * grain,
+    int * bw_filter, int * halation, const char ** name
 )
 {
+    int def_bw = 0;
+    int def_hal = 0;
     switch (live_flt_recipe_preset)
     {
         case 1: // Portra Warm
@@ -201,6 +222,7 @@ static void get_effective_recipe_params(
             *wb_ab = 0;
             *wb_gm = 0;
             *grain = 3;
+            def_bw = (live_flt_rec_bw_filter > 0) ? live_flt_rec_bw_filter : 3;
             if (name) *name = "Tri-X Push 2";
             break;
 
@@ -212,6 +234,8 @@ static void get_effective_recipe_params(
             *wb_ab = live_flt_rec_wb_ab;
             *wb_gm = live_flt_rec_wb_gm;
             *grain = live_flt_rec_grain;
+            def_bw = live_flt_rec_bw_filter;
+            def_hal = live_flt_rec_halation;
             if (name) *name = "Custom Recipe";
             break;
 
@@ -226,6 +250,8 @@ static void get_effective_recipe_params(
             if (name) *name = "Standard Look";
             break;
     }
+    if (bw_filter) *bw_filter = def_bw;
+    if (halation) *halation = def_hal;
 }
 
 static void recipe_save_custom(void * priv, int delta)
@@ -236,7 +262,7 @@ static void recipe_save_custom(void * priv, int delta)
         bmp_printf(FONT_MED, 0, 60, "Failed to save recipe");
         return;
     }
-    char buf[128];
+    char buf[160];
     snprintf(buf, sizeof(buf),
         "BASE=%d\n"
         "HIGH=%d\n"
@@ -244,14 +270,18 @@ static void recipe_save_custom(void * priv, int delta)
         "SAT=%d\n"
         "WB_AB=%d\n"
         "WB_GM=%d\n"
-        "GRAIN=%d\n",
+        "GRAIN=%d\n"
+        "BW_FILT=%d\n"
+        "HALATION=%d\n",
         live_flt_rec_base,
         live_flt_rec_high,
         live_flt_rec_shadow,
         live_flt_rec_sat,
         live_flt_rec_wb_ab,
         live_flt_rec_wb_gm,
-        live_flt_rec_grain
+        live_flt_rec_grain,
+        live_flt_rec_bw_filter,
+        live_flt_rec_halation
     );
     FIO_WriteFile(f, buf, strlen(buf));
     FIO_CloseFile(f);
@@ -285,6 +315,8 @@ static void recipe_load_custom(void * priv, int delta)
         else if (strncmp(line, "WB_AB=", 6) == 0) live_flt_rec_wb_ab = atoi(line + 6);
         else if (strncmp(line, "WB_GM=", 6) == 0) live_flt_rec_wb_gm = atoi(line + 6);
         else if (strncmp(line, "GRAIN=", 6) == 0) live_flt_rec_grain = atoi(line + 6);
+        else if (strncmp(line, "BW_FILT=", 8) == 0) live_flt_rec_bw_filter = atoi(line + 8);
+        else if (strncmp(line, "HALATION=", 9) == 0) live_flt_rec_halation = atoi(line + 9);
 
         line = next ? next + 1 : NULL;
     }
@@ -295,6 +327,8 @@ static void recipe_load_custom(void * priv, int delta)
     live_flt_rec_wb_ab = COERCE(live_flt_rec_wb_ab, -9, 9);
     live_flt_rec_wb_gm = COERCE(live_flt_rec_wb_gm, -9, 9);
     live_flt_rec_grain = COERCE(live_flt_rec_grain, 0, 3);
+    live_flt_rec_bw_filter = COERCE(live_flt_rec_bw_filter, 0, 4);
+    live_flt_rec_halation  = COERCE(live_flt_rec_halation, 0, 2);
     live_flt_recipe_preset = 5; // Custom
     beep();
     bmp_printf(FONT_MED, 0, 60, "Loaded CUSTOM.REC");
@@ -310,7 +344,7 @@ static void recipe_inspect_curve_task(void * priv)
 
     int base = 0, high = 0, shadow = 0, sat = 0, wb_ab = 0, wb_gm = 0, grain = 0;
     const char * name = NULL;
-    get_effective_recipe_params(&base, &high, &shadow, &sat, &wb_ab, &wb_gm, &grain, &name);
+    get_effective_recipe_params(&base, &high, &shadow, &sat, &wb_ab, &wb_gm, &grain, NULL, NULL, &name);
 
     int win_x = 90, win_y = 50, win_w = 540, win_h = 360;
     bmp_fill(COLOR_BLACK, win_x, win_y, win_w, win_h);
@@ -468,9 +502,15 @@ static unsigned int live_flt_display_cbr(unsigned int ctx)
 
     int rec_active = (live_flt_recipe_preset > 0);
     int rec_base = 0, rec_h = 0, rec_s = 0, rec_sat = 0, rec_ab = 0, rec_gm = 0, rec_grain = 0;
+    int rec_bw = 0, rec_hal = 0;
     if (rec_active)
     {
-        get_effective_recipe_params(&rec_base, &rec_h, &rec_s, &rec_sat, &rec_ab, &rec_gm, &rec_grain, NULL);
+        get_effective_recipe_params(&rec_base, &rec_h, &rec_s, &rec_sat, &rec_ab, &rec_gm, &rec_grain, &rec_bw, &rec_hal, NULL);
+    }
+    else
+    {
+        if (live_flt_film_sim == 4) rec_bw = live_flt_rec_bw_filter;
+        if (live_flt_film_sim == 3) rec_hal = (live_flt_rec_halation > 0) ? live_flt_rec_halation : 1;
     }
 
     for (int y = 0; y < height; y++)
@@ -501,7 +541,9 @@ static unsigned int live_flt_display_cbr(unsigned int ctx)
             rec_s,
             rec_sat,
             rec_ab,
-            rec_gm
+            rec_gm,
+            rec_bw,
+            rec_hal
         );
 
         if (dwords_per_row > dwords_visible && row_dst != row_src)
@@ -674,6 +716,20 @@ static struct menu_entry live_flt_menu[] =
                 .help = "LFSR Analog grain level.",
             },
             {
+                .name = "B&W Filter",
+                .priv = &live_flt_rec_bw_filter,
+                .max = 4,
+                .choices = bw_filter_choices,
+                .help = "Optical contrast filter for Tri-X/Monochrome (Yellow, Orange, Red, Green).",
+            },
+            {
+                .name = "Halation Bloom",
+                .priv = &live_flt_rec_halation,
+                .max = 2,
+                .choices = halation_choices,
+                .help = "Analog red halation glow on highlights (Cinestill / Custom).",
+            },
+            {
                 .name = "Save to CUSTOM.REC",
                 .select = recipe_save_custom,
                 .help = "Export recipe parameters to A:/ML/RECIPES/CUSTOM.REC.",
@@ -764,4 +820,6 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(live_flt_rec_wb_ab)
     MODULE_CONFIG(live_flt_rec_wb_gm)
     MODULE_CONFIG(live_flt_rec_grain)
+    MODULE_CONFIG(live_flt_rec_bw_filter)
+    MODULE_CONFIG(live_flt_rec_halation)
 MODULE_CONFIGS_END()

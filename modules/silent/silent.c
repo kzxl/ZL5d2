@@ -172,6 +172,7 @@ static void get_effective_film_recipe(struct film_recipe * r)
                 case 4:
                     r->base_stock = 4; r->highlight = 2; r->shadow = -2;
                     r->saturation = 0; r->wb_ab = 0; r->wb_gm = 0; r->grain = 3;
+                    r->bw_filter = 3; /* Red #25A contrast for Tri-X push */
                     r->name = "Tri-X Push 2";
                     break;
             }
@@ -188,6 +189,8 @@ static void get_effective_film_recipe(struct film_recipe * r)
             struct config_var * v_ab   = module_get_config_var("live_flt.rec_wb_ab");
             struct config_var * v_gm   = module_get_config_var("live_flt.rec_wb_gm");
             struct config_var * v_gr   = module_get_config_var("live_flt.rec_grain");
+            struct config_var * v_bw   = module_get_config_var("live_flt.rec_bw_filter");
+            struct config_var * v_hal  = module_get_config_var("live_flt.rec_halation");
 
             r->base_stock = (v_base && v_base->value) ? *(v_base->value) + 1 : 1;
             r->highlight  = (v_h && v_h->value) ? *(v_h->value) : 0;
@@ -196,6 +199,8 @@ static void get_effective_film_recipe(struct film_recipe * r)
             r->wb_ab      = (v_ab && v_ab->value) ? *(v_ab->value) : 0;
             r->wb_gm      = (v_gm && v_gm->value) ? *(v_gm->value) : 0;
             r->grain      = (v_gr && v_gr->value) ? *(v_gr->value) : silent_pic_grain;
+            r->bw_filter  = (v_bw && v_bw->value) ? *(v_bw->value) : 0;
+            r->halation   = (v_hal && v_hal->value) ? *(v_hal->value) : 0;
             return;
         }
 
@@ -206,6 +211,10 @@ static void get_effective_film_recipe(struct film_recipe * r)
             r->active = 1;
             r->base_stock = film_sim;
             r->grain = silent_pic_grain;
+            struct config_var * v_bw  = module_get_config_var("live_flt.rec_bw_filter");
+            struct config_var * v_hal = module_get_config_var("live_flt.rec_halation");
+            if (film_sim == 4 && v_bw && v_bw->value) r->bw_filter = *(v_bw->value);
+            if (film_sim == 3) r->halation = (v_hal && v_hal->value) ? *(v_hal->value) : 1;
             switch (film_sim)
             {
                 case 1: r->name = "Kodak Portra 400"; break;
@@ -2784,7 +2793,7 @@ static struct menu_entry silent_menu[] = {
                 .priv = &silent_pic_bracket_steps,
                 .max = 3,
                 .choices = bracket_steps_choices,
-                .help = "Electronic shutter exposure bracketing sequence (0 shutter wear).",
+                .help = "Electronic shutter exposure bracketing sequence (0 shutter wear). Saves separate frames for external HDR merge.",
                 .children = (struct menu_entry[]) {
                     {
                         .name = "Bracket Frames",

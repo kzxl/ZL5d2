@@ -450,7 +450,29 @@ static inline int32_t next_film_grain(int strength)
     }
 }
 
-static inline void apply_film_stock(uint32_t preset, uint8_t* py0, uint8_t* py1, uint8_t* pu, uint8_t* pv, int grain_strength)
+static inline uint8_t apply_bw_filter_luma(uint8_t y, uint8_t u, uint8_t v, int filter)
+{
+    if (filter <= 0) return y;
+    int32_t u_diff = (int32_t)u - 128;
+    int32_t v_diff = (int32_t)v - 128;
+
+    int32_t r = clamp_u8((int32_t)y + ((359 * v_diff) >> 8));
+    int32_t g = clamp_u8((int32_t)y - ((88 * u_diff + 183 * v_diff) >> 8));
+    int32_t b = clamp_u8((int32_t)y + ((454 * u_diff) >> 8));
+
+    int32_t y_filt = y;
+    switch (filter)
+    {
+        case 1: y_filt = (128 * r + 115 * g + 13 * b) >> 8; break; // Yellow (#8)
+        case 2: y_filt = (174 * r + 72 * g + 10 * b) >> 8;  break; // Orange (#16)
+        case 3: y_filt = (230 * r + 21 * g + 5 * b) >> 8;   break; // Red (#25A)
+        case 4: y_filt = (38 * r + 192 * g + 26 * b) >> 8;  break; // Green (#11)
+        default: break;
+    }
+    return clamp_u8(y_filt);
+}
+
+static inline void apply_film_stock(uint32_t preset, uint8_t* py0, uint8_t* py1, uint8_t* pu, uint8_t* pv, int grain_strength, int bw_filter, int halation)
 {
     int32_t y0 = *py0;
     int32_t y1 = *py1;
@@ -473,14 +495,27 @@ static inline void apply_film_stock(uint32_t preset, uint8_t* py0, uint8_t* py1,
             v  = clamp_u8(128 + (((v - 128) * 346) >> 8));
             break;
 
-        case 3: // Cinestill 800T: Tungsten cool shadows, warm red halation
+        case 3: // Cinestill 800T: Tungsten cool shadows, warm amber core and red halation bloom
             u  = clamp_u8(128 + (((u - 128) * 320) >> 8));
             v  = clamp_u8(128 + (((v - 128) * 230) >> 8));
-            if (y0 > 185) v = clamp_u8(v + ((y0 - 185) >> 2));
-            if (y1 > 185) v = clamp_u8(v + ((y1 - 185) >> 2));
+            {
+                int thresh = (halation == 2) ? 170 : 185;
+                int mult = (halation == 2) ? 3 : 1;
+                int32_t max_y = (y0 > y1) ? y0 : y1;
+                if (max_y > thresh) {
+                    int32_t glow = (((max_y - thresh) * mult) >> 2);
+                    if (glow > 35) glow = 35;
+                    v = clamp_u8(v + glow);
+                    u = clamp_u8(u - (glow >> 1)); // warm amber shift
+                }
+            }
             break;
 
-        case 4: // Kodak Tri-X 400: Punchy high-contrast monochrome
+        case 4: // Kodak Tri-X 400: Punchy high-contrast monochrome with optical filters
+            if (bw_filter > 0) {
+                y0 = apply_bw_filter_luma((uint8_t)y0, (uint8_t)u, (uint8_t)v, bw_filter);
+                y1 = apply_bw_filter_luma((uint8_t)y1, (uint8_t)u, (uint8_t)v, bw_filter);
+            }
             y0 = (y0 < 128) ? clamp_u8((y0 * 220) >> 8) : clamp_u8(110 + (((y0 - 128) * 290) >> 8));
             y1 = (y1 < 128) ? clamp_u8((y1 * 220) >> 8) : clamp_u8(110 + (((y1 - 128) * 290) >> 8));
             u  = 128;
@@ -593,7 +628,7 @@ void apply_film_recipe_yuv422(
 
             if (recipe->base_stock > 0 && recipe->base_stock <= 5)
             {
-                apply_film_stock((uint32_t)recipe->base_stock, &y0, &y1, &u, &v, 0);
+                apply_film_stock((uint32_t)recipe->base_stock, &y0, &y1, &u, &v, 0, recipe->bw_filter, recipe->halation);
             }
 
             int32_t iy0 = y0, iy1 = y1, iu = u, iv = v;

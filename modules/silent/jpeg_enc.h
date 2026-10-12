@@ -40,6 +40,8 @@ struct film_recipe {
     int wb_ab;          // -9 .. +9 (Amber / Blue)
     int wb_gm;          // -9 .. +9 (Green / Magenta)
     int grain;          // 0: Off, 1: Subtle, 2: Med, 3: Heavy
+    int bw_filter;      // 0: Off, 1: Yellow #8, 2: Orange #16, 3: Red #25A, 4: Green #11
+    int halation;       // 0: Off, 1: Subtle, 2: Strong
     const char* name;   // Recipe name for EXIF / OSD, e.g. "Portra Warm"
 };
 
