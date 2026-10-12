@@ -804,8 +804,17 @@ static void fast_af_trigger(void)
         NotifyBox(2000, "AF Error: Lens in MF or LV off");
         return;
     }
+    if (lens_info.job_state != 0 || is_intervalometer_running() || is_rack_focus_enabled())
+    {
+        NotifyBox(2000, "AF Busy: Camera or motor active");
+        return;
+    }
     fast_af_running = 1;
-    task_create("fast_af", 0x1c, 0x1000, fast_af_task, 0);
+    uint32_t tid = task_create("fast_af", 0x1c, 0x1000, fast_af_task, 0);
+    if (!tid)
+    {
+        fast_af_running = 0;
+    }
 }
 
 static void fast_af_menu_trigger(void * priv, int delta)
