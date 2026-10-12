@@ -304,7 +304,7 @@ static int curve_insp_in_progress = 0;
 
 static void recipe_inspect_curve_task(void * priv)
 {
-    curve_insp_in_progress = 1;
+    /* curve_insp_in_progress was set by recipe_inspect_curve before task_create. */
     gui_stop_menu();
     msleep(400);
 
@@ -390,7 +390,9 @@ static void recipe_inspect_curve_task(void * priv)
 
 static void recipe_inspect_curve(void * priv, int delta)
 {
+    /* Only this menu handler (GUI task, serial) starts the task, so check-then-set is race-free here. */
     if (curve_insp_in_progress) return;
+    curve_insp_in_progress = 1;
     task_create("curve_insp", 0x1c, 0x2000, recipe_inspect_curve_task, 0);
 }
 

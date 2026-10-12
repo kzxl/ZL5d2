@@ -62,13 +62,39 @@ static const char * multiexp_blend_choices[] = { "Average", "Additive", "Screen"
 static const char * bracket_steps_choices[] = { "OFF", "3 Frames (0 - +)", "5 Frames (0 - - + +)", "3 Frames (- 0 +)" };
 static const char * bracket_stepsize_choices[] = { "1.0 EV", "2.0 EV", "0.5 EV" };
 
-static int silent_bracket_active = 0;
-static int silent_snap_in_progress = 0;
+/*
+ * Orchestration flags (snap, bracket, timelapse). They are accessed from the GUI task
+ * (menu handlers), the polling CBR task and the spawned capture tasks, so every claim
+ * uses an IRQ-masked test-and-set. silent_capture_sem serialises the sensor/VRAM access itself.
+ */
+static volatile int silent_bracket_active = 0;
+static volatile int silent_snap_in_progress = 0;
 static struct semaphore * silent_capture_sem = NULL;
+
+/* Atomically sets *flag if it was clear. Returns 1 when the caller now owns it. */
+static int silent_test_and_set(volatile int * flag)
+{
+    uint32_t old = cli();
+    int claimed = !*flag;
+    if (claimed) *flag = 1;
+    sei(old);
+    return claimed;
+}
+
+/* Atomically sets *flag only while no snap or bracket sequence is running. */
+static int silent_claim_if_idle(volatile int * flag)
+{
+    uint32_t old = cli();
+    int claimed = !silent_bracket_active && !silent_snap_in_progress && !*flag;
+    if (claimed) *flag = 1;
+    sei(old);
+    return claimed;
+}
 
 static inline int silent_lock_capture(void)
 {
-    if (!silent_capture_sem) return 1;
+    /* Fail closed: without the semaphore, concurrent captures cannot be excluded. */
+    if (!silent_capture_sem) return 0;
     return (take_semaphore(silent_capture_sem, 0) == 0);
 }
 
@@ -319,6 +345,20 @@ static void silent_log(const char * msg)
         FIO_WriteFile(f, msg, strlen(msg));
         FIO_WriteFile(f, "\n", 1);
         FIO_CloseFile(f);
+    }
+}
+
+/*
+ * Core beep() spins on beep_playing without a timeout (beep.c, unsafe_beep) until the
+ * previous beep's ASIF DMA completes. Skip the feedback instead of stalling a capture
+ * task or the GUI task behind it (in QEMU the completion never arrives, so it hangs).
+ */
+extern int beep_playing;
+static void silent_beep(void)
+{
+    if (!beep_playing)
+    {
+        beep();
     }
 }
 
@@ -1450,17 +1490,20 @@ silent_pic_take_lv(int interactive)
 
         if (ok) silent_log("encode_yuv422_to_jpeg returned SUCCESS (1)");
         else silent_log("encode_yuv422_to_jpeg returned FAILURE (0)");
+
+        /* Capture work is done: release the lock before UI feedback so it cannot stall other captures. */
+        silent_unlock_capture();
+
         if (!ok)
         {
             bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
         }
         else
         {
-            beep();
+            silent_beep();
             bmp_printf(FONT_MED, 0, 60, "Saved %s", filename);
         }
         redraw();
-        silent_unlock_capture();
         return ok;
     }
 
@@ -2112,8 +2155,7 @@ err:
 
 static int silent_pic_take_bracket(int interactive)
 {
-    if (silent_bracket_active) return 0;
-    silent_bracket_active = 1;
+    if (!silent_test_and_set(&silent_bracket_active)) return 0;
 
     int old_tv = lens_info.raw_shutter;
     int ev_units = (silent_pic_bracket_stepsize == 0) ? 8 : (silent_pic_bracket_stepsize == 1) ? 16 : 4;
@@ -2142,17 +2184,29 @@ static int silent_pic_take_bracket(int interactive)
     }
 
     int shots_completed = 0;
+
+    /* Abort only on a new half-shutter press (release -> press edge). When the bracket is
+     * started from silent_pic_polling_cbr the button is still held, which is not an abort. */
+    int halfshutter_was_pressed = get_halfshutter_pressed();
     for (int i = 0; i < total_shots; i++)
     {
-        if (i > 0 && get_halfshutter_pressed())
+        int halfshutter_pressed = get_halfshutter_pressed();
+        if (i > 0 && halfshutter_pressed && !halfshutter_was_pressed)
         {
             silent_log("silent_pic_take_bracket: aborted by user");
             break;
         }
+        halfshutter_was_pressed = halfshutter_pressed;
 
         int target_tv = COERCE(old_tv + tv_offsets[i], 16, FASTEST_SHUTTER_SPEED_RAW);
-        lens_set_rawshutter(target_tv);
+        char step_msg[80];
+        snprintf(step_msg, sizeof(step_msg), "bracket %d/%d @%dms: hs=%d, set tv %d (from %d)",
+                 i + 1, total_shots, get_ms_clock(), halfshutter_pressed, target_tv, old_tv);
+        silent_log(step_msg);
+        int tv_ok = lens_set_rawshutter(target_tv);
         msleep(150);
+        snprintf(step_msg, sizeof(step_msg), "bracket %d/%d: tv ok=%d now %d, capturing", i + 1, total_shots, tv_ok, lens_info.raw_shutter);
+        silent_log(step_msg);
 
         bmp_printf(FONT_MED, 0, 60, "Silent Bracket %d/%d (EV %+d)...", i + 1, total_shots, -tv_offsets[i] / 8);
         if (silent_pic_mode == SILENT_PIC_MODE_FULLRES)
@@ -2165,6 +2219,7 @@ static int silent_pic_take_bracket(int interactive)
         }
     }
 
+    silent_log("bracket: restoring tv");
     lens_set_rawshutter(old_tv);
     silent_bracket_active = 0;
     bmp_printf(FONT_MED, 0, 60, "Silent Bracket complete (%d/%d shots)", shots_completed, total_shots);
@@ -2184,15 +2239,16 @@ silent_pic_take(unsigned int interactive) // for remote release, set interactive
     if (silent_bracket_active || silent_snap_in_progress)
     {
         silent_log("silent_pic_take: capture in progress, ignoring trigger");
-        return CBR_RET_STOP;
+        /* No picture taken: CBR_RET_STOP would make take_a_pic() report success. */
+        return CBR_RET_ERROR;
     }
 
     if (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_MLV && !silent_pic_mlv_available)
     {
         NotifyBox(2000, "MLV module not loaded. Will abort.");
         
-        /* user error; do not try to take a regular picture if this fails */
-        return CBR_RET_STOP;
+        /* user error; do not try to take a regular picture, and report that none was taken */
+        return CBR_RET_ERROR;
     }
 
     if (silent_pic_bracket_steps > 0 && !silent_bracket_active)
@@ -2343,7 +2399,7 @@ static unsigned int silent_pic_polling_cbr(unsigned int ctx)
 
 static void silent_snap_task(void * priv)
 {
-    silent_snap_in_progress = 1;
+    /* silent_snap_in_progress was claimed by the menu handler before task_create (no TOCTOU window). */
     silent_log("1: silent_snap_task started");
     silent_pic_enabled = 1;
     gui_stop_menu();
@@ -2379,13 +2435,14 @@ static const char * tl_max_choices[] = { "Unlimited", "50", "100", "250", "500",
 
 static const char * tl_powersave_choices[] = { "Keep Screen On", "Screen Off (Powersave)" };
 
-static int silent_tl_running = 0;
+/* Run request (cleared by Stop / half-shutter) vs. task lifetime (cleared only when the task exits). */
+static volatile int silent_tl_running = 0;
+static volatile int silent_tl_task_alive = 0;
 static int silent_tl_frame_count = 0;
 
 static void silent_timelapse_task(void * priv)
 {
-    silent_tl_running = 1;
-    silent_tl_frame_count = 0;
+    /* silent_tl_task_alive, silent_tl_running and the frame counter were set by silent_tl_action. */
     silent_pic_enabled = 1;
     gui_stop_menu();
     msleep(500);
@@ -2402,7 +2459,7 @@ static void silent_timelapse_task(void * priv)
 
         if (get_halfshutter_pressed())
         {
-            beep();
+            silent_beep();
             bmp_printf(FONT_MED, 0, 60, "Timelapse stopped by user.");
             break;
         }
@@ -2453,8 +2510,9 @@ static void silent_timelapse_task(void * priv)
     }
 
     silent_tl_running = 0;
-    beep();
+    silent_beep();
     bmp_printf(FONT_MED, 0, 60, "Timelapse finished: %d frames.", silent_tl_frame_count);
+    silent_tl_task_alive = 0;
 }
 
 static void silent_tl_action(void * priv, int delta)
@@ -2462,17 +2520,26 @@ static void silent_tl_action(void * priv, int delta)
     if (silent_tl_running)
     {
         silent_tl_running = 0;
-        beep();
+        silent_beep();
+        return;
     }
-    else
+
+    if (silent_tl_task_alive)
     {
-        if (silent_bracket_active || silent_snap_in_progress)
-        {
-            bmp_printf(FONT_MED, 0, 60, "Silent capture in progress...");
-            return;
-        }
-        task_create("silent_tl", 0x1c, 0x2000, silent_timelapse_task, 0);
+        /* previous task still finishing its current shot / wait tick */
+        bmp_printf(FONT_MED, 0, 60, "Timelapse stopping, try again...");
+        return;
     }
+
+    if (!silent_claim_if_idle(&silent_tl_task_alive))
+    {
+        bmp_printf(FONT_MED, 0, 60, "Silent capture in progress...");
+        return;
+    }
+
+    silent_tl_frame_count = 0;
+    silent_tl_running = 1;
+    task_create("silent_tl", 0x1c, 0x2000, silent_timelapse_task, 0);
 }
 
 static MENU_UPDATE_FUNC(silent_tl_status_update)
@@ -2488,26 +2555,26 @@ static MENU_UPDATE_FUNC(silent_tl_status_update)
     }
 }
 
-static void silent_pic_snap_now(void * priv, int delta)
+/* Claims silent_snap_in_progress before the task exists, so a second press cannot spawn a second task. */
+static void silent_start_snap_task(const char * origin)
 {
-    if (silent_snap_in_progress || silent_bracket_active)
+    if (!silent_claim_if_idle(&silent_snap_in_progress))
     {
         bmp_printf(FONT_MED, 0, 100, "Silent capture in progress...");
         return;
     }
-    silent_log("0: silent_pic_snap_now invoked");
+    silent_log(origin);
     task_create("silent_snap", 0x1c, 0x2000, silent_snap_task, 0);
+}
+
+static void silent_pic_snap_now(void * priv, int delta)
+{
+    silent_start_snap_task("0: silent_pic_snap_now invoked");
 }
 
 static void silent_bracket_snap(void * priv, int delta)
 {
-    if (silent_snap_in_progress || silent_bracket_active)
-    {
-        bmp_printf(FONT_MED, 0, 100, "Silent capture in progress...");
-        return;
-    }
-    silent_log("0: silent_bracket_snap invoked");
-    task_create("silent_snap", 0x1c, 0x2000, silent_snap_task, 0);
+    silent_start_snap_task("0: silent_bracket_snap invoked");
 }
 
 static struct menu_entry silent_menu[] = {
@@ -2753,6 +2820,11 @@ static unsigned int silent_init()
 
 static unsigned int silent_deinit()
 {
+    /* Ask the timelapse task to exit; it polls silent_tl_running every 100 ms. */
+    silent_tl_running = 0;
+
+    /* silent_capture_sem is intentionally not deleted: the 5D2 stubs export no
+     * delete_semaphore, and core never frees module memory on unload (module.c). */
     return 0;
 }
 
