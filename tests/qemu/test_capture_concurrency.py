@@ -2,9 +2,11 @@
 """
 Strict QEMU concurrency tests for the silent module (exact capture counts).
 
-Scenarios (default: menu_bracket, rapid_snap; name scenarios on the command line to override):
+Scenarios (default: menu_bracket, rapid_snap, recipe_snap, multiexp_recipe; name scenarios to override):
   menu_bracket       Bracket Snap Now with 3 frames configured  -> exactly 3 JPEGs, all decodable
   rapid_snap         three SET presses within ~150 ms           -> exactly 1 JPEG
+  recipe_snap        film recipe active, single snap            -> exactly 1 JPEG (encoder strip grading, S7)
+  multiexp_recipe    2-frame multi-exposure + film recipe       -> exactly 1 JPEG, accumulator allocated (S6)
   halfshutter_hold   bracket started by holding half-shutter    -> exactly 3 JPEGs, no self-abort (S1)
                      OPT-IN ONLY: not reproducible in qemu-eos 5D2. Measured: with a 6 s Shift hold the
                      firmware flag at 0x1c10 reads 1 for ~330 ms only, and display_idle() stays 0 in
@@ -18,7 +20,7 @@ import sys
 import tempfile
 import time
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 import qemu_harness as qh
 
@@ -82,9 +84,13 @@ def scenario_rapid_snap(_args):
         for _ in range(3):
             cam.key("spc", wait=0.05)
         time.sleep(10)
-    return report("rapid_snap", qh.list_captures(), 1,
+    captures = qh.list_captures()
+    spread = chroma_spread(captures[0]) if captures else 0
+    print(f"    rapid_snap (ungraded baseline) chroma spread = {spread}")
+    return report("rapid_snap", captures, 1,
                   [("single snap task started",
-                    lambda log: sum("silent_snap_task started" in l for l in log) == 1)])
+                    lambda log: sum("silent_snap_task started" in l for l in log) == 1),
+                   ("ungraded capture has colour (monochrome checks are not vacuous)", lambda _log: spread > 3)])
 
 
 def scenario_halfshutter_hold(args):
@@ -98,11 +104,62 @@ def scenario_halfshutter_hold(args):
                     lambda log: not any("aborted by user" in l for l in log))])
 
 
-DEFAULT_SCENARIOS = ["menu_bracket", "rapid_snap"]
+TRIX_RECIPE = [l for l in SILENT_BASE if "film_sim" not in l] + [
+    "silent.pic.film_sim = 5",  # film_sim 5 -> stock 4 (Tri-X, chroma forced to 128)
+    "silent.pic.grain = 0",
+]
+
+
+def chroma_spread(name):
+    """Max per-pixel |R-G| / |G-B| of a capture; ~0 for a monochrome JPEG."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with Image.open(qh.fetch_capture(name, tmp)) as img:
+            r, g, b = img.convert("RGB").split()
+            rg = ImageChops.difference(r, g).getextrema()[1]
+            gb = ImageChops.difference(g, b).getextrema()[1]
+    return max(rg, gb)
+
+
+def scenario_recipe_snap(_args):
+    """S7: film recipe on a live-VRAM source goes through the encoder strip copy."""
+    qh.reset_card({"SILENT.CFG": TRIX_RECIPE + ["silent.bracket_steps = 0"]})
+    with qh.Camera() as cam:
+        cam.open_silent_submenu()
+        cam.key("spc")
+        time.sleep(15)
+    captures = qh.list_captures()
+    spread = chroma_spread(captures[0]) if captures else 255
+    print(f"    recipe_snap chroma spread = {spread}")
+    return report("recipe_snap", captures, 1,
+                  [("encoder reported success", lambda log: any("returned SUCCESS" in l for l in log)),
+                   ("recipe active (stock 4)", lambda log: any("jpeg: recipe stock=4" in l for l in log)),
+                   ("saved file is monochrome (recipe applied)", lambda _log: spread <= 3)])
+
+
+def scenario_multiexp_recipe(_args):
+    """S6 + S7: 2-frame multi-exposure accumulator, graded by the encoder, freed after encode."""
+    qh.reset_card({"SILENT.CFG": TRIX_RECIPE + ["silent.bracket_steps = 0", "silent.multiexp = 1"]})
+    with qh.Camera() as cam:
+        cam.open_silent_submenu()
+        cam.key("spc")
+        time.sleep(20)
+    captures = qh.list_captures()
+    spread = chroma_spread(captures[0]) if captures else 255
+    print(f"    multiexp_recipe chroma spread = {spread}")
+    return report("multiexp_recipe", captures, 1,
+                  [("encoder reported success", lambda log: any("returned SUCCESS" in l for l in log)),
+                   ("2 of 2 frames blended", lambda log: any("multiexp: blended 2/2 frames" in l for l in log)),
+                   ("no allocation failure", lambda log: not any("allocation failed" in l for l in log)),
+                   ("saved file is monochrome (recipe applied)", lambda _log: spread <= 3)])
+
+
+DEFAULT_SCENARIOS = ["menu_bracket", "rapid_snap", "recipe_snap", "multiexp_recipe"]
 
 SCENARIOS = {
     "menu_bracket": scenario_menu_bracket,
     "rapid_snap": scenario_rapid_snap,
+    "recipe_snap": scenario_recipe_snap,
+    "multiexp_recipe": scenario_multiexp_recipe,
     "halfshutter_hold": scenario_halfshutter_hold,
 }
 

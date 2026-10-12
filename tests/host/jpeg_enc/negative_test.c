@@ -70,6 +70,23 @@ static long file_size(const char* path)
     return n;
 }
 
+static int files_equal(const char* a, const char* b)
+{
+    FILE* fa = fopen(a, "rb");
+    FILE* fb = fopen(b, "rb");
+    int equal = (fa && fb);
+    while (equal)
+    {
+        int ca = fgetc(fa);
+        int cb = fgetc(fb);
+        if (ca != cb) equal = 0;
+        if (ca == EOF || cb == EOF) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return equal;
+}
+
 static void fill_frame(void)
 {
     for (int y = 0; y < H; y++)
@@ -180,6 +197,81 @@ int main(int argc, char** argv)
               "full-res width clamped to raw row (no over-read)");
     } else {
         check(0, "full-res guard-page allocation");
+    }
+
+    /* 9. Recipe encode (S7): the source buffer is read-only and output matches in-place apply + encode. */
+    {
+        enum { PAD = 16, RP = W * 2 + PAD }; /* padded pitch exercises the strip copy stride */
+        static uint8_t src[H * RP] __attribute__((aligned(4)));
+        static uint8_t pristine[H * RP];
+        static uint8_t ref[H * RP] __attribute__((aligned(4)));
+        for (int i = 0; i < H * RP; i++) src[i] = (uint8_t)((i * 31 + (i >> 7)) & 0xFF);
+        memcpy(pristine, src, sizeof(src));
+        memcpy(ref, src, sizeof(src));
+
+        struct film_recipe recipe;
+        memset(&recipe, 0, sizeof(recipe));
+        recipe.active = 1;
+        recipe.base_stock = 2;
+        recipe.highlight = 1;
+        recipe.shadow = -1;
+        recipe.saturation = 2;
+        recipe.wb_ab = 3;
+        recipe.wb_gm = -2;
+        recipe.grain = 0; /* deterministic: the grain LFSR state is shared across calls */
+
+        apply_film_recipe_yuv422(ref, W, H, RP, &recipe);
+        snprintf(path, sizeof(path), "%s/recipe_ref.jpg", dir);
+        snprintf(path2, sizeof(path2), "%s/recipe_strip.jpg", dir);
+        remove(path); remove(path2);
+        int rc_ref = encode_yuv422_to_jpeg(ref, W, H, RP, 85, NULL, path);
+        int rc_strip = encode_yuv422_recipe_to_jpeg(src, W, H, RP, 85, &recipe, NULL, path2);
+        check(rc_ref == 1 && rc_strip == 1, "recipe strip encode succeeds");
+        check(memcmp(src, pristine, sizeof(src)) == 0, "recipe strip encode leaves source untouched");
+        check(files_equal(path, path2), "recipe strip output equals in-place apply + encode");
+        {
+            char plain[512];
+            snprintf(plain, sizeof(plain), "%s/recipe_plain.jpg", dir);
+            remove(plain);
+            int rc_plain = encode_yuv422_to_jpeg(src, W, H, RP, 85, NULL, plain);
+            check(rc_plain == 1 && !files_equal(plain, path2), "recipe output differs from ungraded encode");
+        }
+
+        /* Height not a multiple of 8: the last partial strip must be handled identically. */
+        enum { HP = 21 };
+        memcpy(ref, pristine, sizeof(ref));
+        apply_film_recipe_yuv422(ref, W, HP, RP, &recipe);
+        remove(path); remove(path2);
+        rc_ref = encode_yuv422_to_jpeg(ref, W, HP, RP, 85, NULL, path);
+        rc_strip = encode_yuv422_recipe_to_jpeg(src, W, HP, RP, 85, &recipe, NULL, path2);
+        check(rc_ref == 1 && rc_strip == 1 && files_equal(path, path2), "recipe strip handles partial last strip");
+
+        /* Grain active: source must still be untouched. */
+        recipe.grain = 3;
+        remove(path2);
+        rc_strip = encode_yuv422_recipe_to_jpeg(src, W, H, RP, 85, &recipe, NULL, path2);
+        check(rc_strip == 1 && memcmp(src, pristine, sizeof(src)) == 0, "recipe with grain leaves source untouched");
+
+        /* NULL / inactive recipe is identical to the plain encoder. */
+        remove(path); remove(path2);
+        rc_ref = encode_yuv422_to_jpeg(src, W, H, RP, 85, NULL, path);
+        rc_strip = encode_yuv422_recipe_to_jpeg(src, W, H, RP, 85, NULL, NULL, path2);
+        check(rc_ref == 1 && rc_strip == 1 && files_equal(path, path2), "NULL recipe equals plain encode");
+    }
+
+    /* 10. Recipe encode rejects widths beyond the internal strip buffer instead of overflowing it. */
+    {
+        enum { WIDE = 5632 + 2, WH = 8 };
+        uint8_t* wide = calloc((size_t)WIDE * 2 * WH, 1);
+        struct film_recipe recipe;
+        memset(&recipe, 0, sizeof(recipe));
+        recipe.active = 1;
+        recipe.base_stock = 1;
+        snprintf(path, sizeof(path), "%s/recipe_wide.jpg", dir);
+        remove(path);
+        int rc = wide ? encode_yuv422_recipe_to_jpeg(wide, WIDE, WH, WIDE * 2, 85, &recipe, NULL, path) : -1;
+        check(rc == 0 && !file_exists(path), "recipe encode rejects width above strip buffer");
+        free(wide);
     }
 
     printf("\n%d/%d assertions passed\n", total - failures, total);

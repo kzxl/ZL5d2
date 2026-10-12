@@ -1107,6 +1107,7 @@ static int encode_yuv422_locked(
     int height,
     int pitch,
     int quality,
+    const struct film_recipe* recipe,
     const struct jpeg_exif_tags* exif,
     const char* out_path
 ) {
@@ -1122,6 +1123,8 @@ static int encode_yuv422_locked(
 
     int mcu_h = 8;
     int mcus_y = (height + mcu_h - 1) / mcu_h;
+    int use_recipe = (recipe && recipe->active);
+    int strip_pitch = width * 2;
 
     for (int my = 0; my < mcus_y && !io_error; my++) {
         int py0 = my * mcu_h;
@@ -1129,10 +1132,45 @@ static int encode_yuv422_locked(
         int valid_lines = (remaining >= 8) ? 8 : remaining;
 
         const uint8_t* row_ptr = uyvy_data + (size_t)py0 * (size_t)pitch;
-        encode_mcu_row(row_ptr, width, pitch, valid_lines, &prev_dc_y, &prev_dc_u, &prev_dc_v);
+        if (use_recipe) {
+            /* Grade a private copy of the strip: the source may be live VRAM owned by the display. */
+            for (int r = 0; r < valid_lines; r++) {
+                memcpy(strip_buf + r * strip_pitch, row_ptr + (size_t)r * (size_t)pitch, (size_t)strip_pitch);
+            }
+            apply_film_recipe_yuv422(strip_buf, width, valid_lines, strip_pitch, recipe);
+            encode_mcu_row(strip_buf, width, strip_pitch, valid_lines, &prev_dc_y, &prev_dc_u, &prev_dc_v);
+        } else {
+            encode_mcu_row(row_ptr, width, pitch, valid_lines, &prev_dc_y, &prev_dc_u, &prev_dc_v);
+        }
     }
 
     return finish_jpeg_file(out_path);
+}
+
+int encode_yuv422_recipe_to_jpeg(
+    const uint8_t* uyvy_data,
+    int width,
+    int height,
+    int pitch,
+    int quality,
+    const struct film_recipe* recipe,
+    const struct jpeg_exif_tags* exif,
+    const char* out_path
+) {
+    int strip_ok = !(recipe && recipe->active) || width <= STRIP_MAX_WIDTH;
+    if (!uyvy_data || !out_path || !jpeg_geometry_valid(width, height, pitch) || !strip_ok) {
+        printf("[JPEG_ENC] Invalid args: uyvy=%p w=%d h=%d pitch=%d path=%s\n",
+               uyvy_data, width, height, pitch, out_path ? out_path : "NULL");
+        return 0;
+    }
+
+    if (!encoder_try_acquire()) {
+        printf("[JPEG_ENC] Encoder busy, request refused\n");
+        return 0;
+    }
+    int ok = encode_yuv422_locked(uyvy_data, width, height, pitch, quality, recipe, exif, out_path);
+    encoder_release();
+    return ok;
 }
 
 int encode_yuv422_to_jpeg(
@@ -1144,19 +1182,7 @@ int encode_yuv422_to_jpeg(
     const struct jpeg_exif_tags* exif,
     const char* out_path
 ) {
-    if (!uyvy_data || !out_path || !jpeg_geometry_valid(width, height, pitch)) {
-        printf("[JPEG_ENC] Invalid args: uyvy=%p w=%d h=%d pitch=%d path=%s\n",
-               uyvy_data, width, height, pitch, out_path ? out_path : "NULL");
-        return 0;
-    }
-
-    if (!encoder_try_acquire()) {
-        printf("[JPEG_ENC] Encoder busy, request refused\n");
-        return 0;
-    }
-    int ok = encode_yuv422_locked(uyvy_data, width, height, pitch, quality, exif, out_path);
-    encoder_release();
-    return ok;
+    return encode_yuv422_recipe_to_jpeg(uyvy_data, width, height, pitch, quality, NULL, exif, out_path);
 }
 
 static int encode_raw_fullres_locked(

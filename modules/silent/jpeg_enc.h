@@ -72,6 +72,29 @@ int encode_yuv422_to_jpeg(
 );
 
 /**
+ * Same as encode_yuv422_to_jpeg, but grades the image with an optional film recipe.
+ *
+ * The recipe is applied to an internal 8-line strip copy; `uyvy_data` is never written,
+ * so it is safe to pass live LiveView VRAM (no display corruption, no race with the
+ * LiveView writer). Output is byte-identical to apply_film_recipe_yuv422() on a copy
+ * followed by encode_yuv422_to_jpeg().
+ *
+ * @param recipe    Film recipe (can be NULL or inactive: plain encode).
+ *                  When active, width must not exceed 5632 pixels (strip buffer size).
+ * @return 1 on success, 0 on invalid input, busy encoder or I/O error.
+ */
+int encode_yuv422_recipe_to_jpeg(
+    const uint8_t* uyvy_data,
+    int width,
+    int height,
+    int pitch,
+    int quality,
+    const struct film_recipe* recipe,
+    const struct jpeg_exif_tags* exif,
+    const char* out_path
+);
+
+/**
  * Encodes a 21.1MP full-resolution RAW sensor capture directly to a Baseline JPEG file.
  * 
  * Safety & Streaming Guarantees:

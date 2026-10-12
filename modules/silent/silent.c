@@ -960,11 +960,8 @@ static int silent_pic_save_file(struct raw_info * raw_info)
                     bmp_printf(FONT_MED, 0, 83, "VRAM error");
                     return 0;
                 }
-                if (recipe.active)
-                {
-                    apply_film_recipe_yuv422(vram->vram, vram->width, vram->height, vram->pitch, &recipe);
-                }
-                int ok = encode_yuv422_to_jpeg(vram->vram, vram->width, vram->height, vram->pitch, quality, &exif, filename);
+                /* VRAM is owned by the display: the encoder grades a private strip copy instead. */
+                int ok = encode_yuv422_recipe_to_jpeg(vram->vram, vram->width, vram->height, vram->pitch, quality, &recipe, &exif, filename);
                 if (!ok) bmp_printf(FONT_MED, 0, 83, "JPEG save error (card full?)");
                 return ok;
             }
@@ -1394,16 +1391,29 @@ silent_pic_take_lv(int interactive)
 
         uint8_t * accum = NULL;
         int num_frames = 1;
+        int frames_blended = 1;
         if (silent_pic_multiexp > 0 && !silent_bracket_active)
         {
             num_frames = (silent_pic_multiexp == 1) ? 2 :
                          (silent_pic_multiexp == 2) ? 3 :
                          (silent_pic_multiexp == 3) ? 4 : 8;
+            /*
+             * Heap-rule exemption (R_EMBEDDED): exactly one allocation per multi-exposure capture,
+             * outside every per-pixel loop, in the shoot task (never an ISR). The accumulator lives
+             * only while the feature is used and is freed right after encoding. Pre-allocating it
+             * would pin about 0.7 MB (720x480 UYVY) for as long as the option stays enabled.
+             */
             accum = fio_malloc(frame_bytes);
             if (accum)
             {
                 memcpy(accum, vram->vram, frame_bytes);
                 buf = accum;
+            }
+            else
+            {
+                silent_log("multiexp: accumulator allocation failed, saving a single frame");
+                bmp_printf(FONT_MED, 0, 83, "Multi-Exp: no memory, single frame");
+                num_frames = 1;
             }
         }
 
@@ -1415,6 +1425,15 @@ silent_pic_take_lv(int interactive)
                 msleep(120);
                 vram = get_yuv422_vram();
                 if (!vram || !vram->vram) break;
+
+                /* The accumulator layout is fixed: a resized frame would be over-read or mis-blended. */
+                int cur_pitch = vram->pitch ? vram->pitch : 1440;
+                int cur_h = vram->height ? vram->height : 480;
+                if (cur_pitch != pitch || cur_h != h)
+                {
+                    silent_log("multiexp: LiveView geometry changed, blend stopped");
+                    break;
+                }
 
                 uint8_t * cur = (uint8_t*)vram->vram;
                 int blend_mode = silent_pic_multiexp_blend;
@@ -1460,7 +1479,15 @@ silent_pic_take_lv(int interactive)
                         accum[p + 2] = (uint8_t)(128 + (((int)v_a - 128) + ((int)v_b - 128)) / 2);
                     }
                 }
+                frames_blended = k + 1;
             }
+        }
+
+        if (accum)
+        {
+            char msg[48];
+            snprintf(msg, sizeof(msg), "multiexp: blended %d/%d frames", frames_blended, num_frames);
+            silent_log(msg);
         }
 
         silent_capture_lv_metadata();
@@ -1475,13 +1502,15 @@ silent_pic_take_lv(int interactive)
         int quality = get_jpeg_quality();
         struct jpeg_exif_tags exif;
         fill_jpeg_exif(&exif, &recipe);
-
         if (recipe.active)
         {
-            apply_film_recipe_yuv422((uint8_t*)buf, w, h, pitch, &recipe);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "jpeg: recipe stock=%d grain=%d", recipe.base_stock, recipe.grain);
+            silent_log(msg);
         }
 
-        ok = encode_yuv422_to_jpeg(buf, w, h, pitch, quality, &exif, filename);
+        /* buf may be live VRAM: the recipe is applied by the encoder on a private strip copy. */
+        ok = encode_yuv422_recipe_to_jpeg(buf, w, h, pitch, quality, &recipe, &exif, filename);
         if (accum)
         {
             fio_free(accum);
