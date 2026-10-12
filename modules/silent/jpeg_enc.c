@@ -137,6 +137,22 @@ static FILE* out_file = NULL;
 static uint32_t bit_buffer = 0;
 static int bit_count = 0;
 
+/* Latched when FIO_WriteFile reports a short write; cleared at the start of every encode. */
+static int io_error = 0;
+
+/*
+ * Every static buffer in this file is shared by both exported encoders, so only
+ * one encode may run at a time. Acquired with IRQs masked (test-and-set).
+ */
+static volatile int encoder_busy = 0;
+
+/* Input contract (validated before any file is created). */
+#define JPEG_MIN_WIDTH 16
+#define JPEG_MAX_DIM 65535
+
+/* EXIF string caps keep the TIFF block well inside exif_payload[]. */
+#define EXIF_MODEL_MAX_CHARS 63
+
 // Working blocks in BSS (eliminates stack consumption!)
 static int32_t dct_workspace[64];
 static int16_t y0_block[64];
@@ -188,7 +204,12 @@ static inline uint8_t clamp_u8(int32_t val) {
 
 static void flush_out_buf() {
     if (out_buf_pos > 0 && out_file) {
-        FIO_WriteFile(out_file, out_buf, out_buf_pos);
+        if (!io_error) {
+            int written = FIO_WriteFile(out_file, out_buf, out_buf_pos);
+            if (written != (int)out_buf_pos) {
+                io_error = 1; /* card full / I/O error: stop writing, caller removes the file */
+            }
+        }
         out_buf_pos = 0;
     }
 }
@@ -201,7 +222,10 @@ static inline void write_byte(uint8_t b) {
 }
 
 static void write_bits(uint32_t code, int len) {
-    bit_buffer |= (code & ((1 << len) - 1)) << (32 - bit_count - len);
+    if (len <= 0) {
+        return; /* zero-length code (DC diff category 0): avoids a shift by 32 */
+    }
+    bit_buffer |= (code & ((1u << len) - 1)) << (32 - bit_count - len);
     bit_count += len;
     while (bit_count >= 8) {
         uint8_t b = (uint8_t)(bit_buffer >> 24);
@@ -216,14 +240,11 @@ static void write_bits(uint32_t code, int len) {
 
 static void flush_bits() {
     if (bit_count > 0) {
-        uint8_t b = (uint8_t)(bit_buffer >> 24);
-        write_byte(b);
-        if (b == 0xFF) {
-            write_byte(0x00);
-        }
-        bit_buffer = 0;
-        bit_count = 0;
+        /* T.81 F.1.2.3: pad the final partial byte with 1-bits (write_bits handles stuffing). */
+        write_bits(0x7F, 8 - bit_count);
     }
+    bit_buffer = 0;
+    bit_count = 0;
     flush_out_buf();
 }
 
@@ -350,7 +371,7 @@ static void fdct_2d(const int16_t* in, int16_t* out, const int32_t* recip) {
     // Rows (input pre-scaled to keep precision through the fixed-point butterflies)
     for (int i = 0; i < 8; i++) {
         for (int j = 0; j < 8; j++) {
-            dct_workspace[i * 8 + j] = (int32_t)in[i * 8 + j] << FDCT_PASS_BITS;
+            dct_workspace[i * 8 + j] = (int32_t)in[i * 8 + j] * (1 << FDCT_PASS_BITS);
         }
         fdct_1d(&dct_workspace[i * 8]);
     }
@@ -804,8 +825,16 @@ static inline void put_ifd_entry(uint8_t* buf, int offset, uint16_t tag, uint16_
     put_u32_le(buf, offset + 8, val_or_offset);
 }
 
-static void write_jpeg_exif(const struct jpeg_exif_tags* exif) {
-    if (!exif) return;
+/* Bounded strlen (strnlen is not guaranteed by the DryOS libc subset). */
+static int bounded_strlen(const char* s, int max_chars) {
+    int n = 0;
+    while (n < max_chars && s[n]) n++;
+    return n;
+}
+
+/* Emits the APP1/EXIF segment. Returns 1 if written, 0 if skipped. */
+static int write_jpeg_exif(const struct jpeg_exif_tags* exif) {
+    if (!exif) return 0;
 
     memset(exif_payload, 0, sizeof(exif_payload));
 
@@ -844,8 +873,11 @@ static void write_jpeg_exif(const struct jpeg_exif_tags* exif) {
     memcpy(s_comment, "ASCII\0\0\0", 8);
     int txt_len = snprintf(s_comment + 8, sizeof(s_comment) - 8, "Film: %s",
                            exif->film_name ? exif->film_name : "Standard");
+    /* snprintf returns the untruncated length; clamp to what was actually stored. */
+    if (txt_len < 0) txt_len = 0;
+    if (txt_len > (int)sizeof(s_comment) - 9) txt_len = (int)sizeof(s_comment) - 9;
     int len_make = strlen(s_make) + 1;
-    int len_model = strlen(s_model) + 1;
+    int len_model = bounded_strlen(s_model, EXIF_MODEL_MAX_CHARS) + 1; /* payload is zeroed: NUL implied */
     int len_soft = strlen(s_soft) + 1;
     int len_date = strlen(s_date) + 1;
     int len_desc = strlen(s_desc) + 1;
@@ -860,6 +892,13 @@ static void write_jpeg_exif(const struct jpeg_exif_tags* exif) {
     int off_fn = off_exp + 8;
     int off_fl = off_fn + 8;
     int off_comm = off_fl + 8;
+
+    int total_tiff_len = off_comm + len_comm;
+    if (total_tiff_len > (int)sizeof(exif_payload)) {
+        /* Unreachable with the caps above; kept so a future field cannot overflow the buffer. */
+        printf("[JPEG_ENC] EXIF block %d B exceeds %d B, skipped\n", total_tiff_len, (int)sizeof(exif_payload));
+        return 0;
+    }
 
     // 2. IFD0 (6 entries at ifd0_offset)
     put_u16_le(exif_payload, ifd0_offset, 6);
@@ -891,7 +930,7 @@ static void write_jpeg_exif(const struct jpeg_exif_tags* exif) {
 
     // 4. Data Area
     memcpy(exif_payload + off_make, s_make, len_make);
-    memcpy(exif_payload + off_model, s_model, len_model);
+    memcpy(exif_payload + off_model, s_model, len_model - 1);
     memcpy(exif_payload + off_soft, s_soft, len_soft);
     memcpy(exif_payload + off_date, s_date, len_date);
     memcpy(exif_payload + off_desc, s_desc, len_desc);
@@ -906,11 +945,6 @@ static void write_jpeg_exif(const struct jpeg_exif_tags* exif) {
     put_u32_le(exif_payload, off_fl + 4, fl_den);
 
     memcpy(exif_payload + off_comm, s_comment, len_comm);
-
-    int total_tiff_len = off_comm + len_comm;
-    if (total_tiff_len > (int)sizeof(exif_payload)) {
-        total_tiff_len = sizeof(exif_payload);
-    }
 
     // 5. Emit APP1 Marker & Length
     write_byte(0xFF);
@@ -927,6 +961,7 @@ static void write_jpeg_exif(const struct jpeg_exif_tags* exif) {
     for (int i = 0; i < total_tiff_len; i++) {
         write_byte(exif_payload[i]);
     }
+    return 1;
 }
 
 static void write_jpeg_headers(int width, int height, int quality, const struct jpeg_exif_tags* exif)
@@ -939,20 +974,20 @@ static void write_jpeg_headers(int width, int height, int quality, const struct 
     // 1. SOI (Start of Image)
     write_byte(0xFF); write_byte(0xD8);
 
-    // Optional APP1 (EXIF Header)
-    if (exif) {
-        write_jpeg_exif(exif);
-    }
+    // 2. APP1 (EXIF) when tags are supplied, otherwise APP0 (JFIF).
+    //    Exif 2.x requires APP1 to follow SOI directly, so the two are mutually exclusive.
+    int has_exif = write_jpeg_exif(exif);
 
-    // 2. APP0 (JFIF Header)
-    write_byte(0xFF); write_byte(0xE0);
-    write_byte(0x00); write_byte(0x10); // Length = 16
-    write_byte('J'); write_byte('F'); write_byte('I'); write_byte('F'); write_byte(0x00);
-    write_byte(0x01); write_byte(0x01); // Version 1.1
-    write_byte(0x00);                   // Units: None
-    write_byte(0x00); write_byte(0x01); // X density
-    write_byte(0x00); write_byte(0x01); // Y density
-    write_byte(0x00); write_byte(0x00); // Thumbnail: 0x0
+    if (!has_exif) {
+        write_byte(0xFF); write_byte(0xE0);
+        write_byte(0x00); write_byte(0x10); // Length = 16
+        write_byte('J'); write_byte('F'); write_byte('I'); write_byte('F'); write_byte(0x00);
+        write_byte(0x01); write_byte(0x01); // Version 1.1
+        write_byte(0x00);                   // Units: None
+        write_byte(0x00); write_byte(0x01); // X density
+        write_byte(0x00); write_byte(0x01); // Y density
+        write_byte(0x00); write_byte(0x00); // Thumbnail: 0x0
+    }
 
     // 3. DQT (Quantization Tables)
     write_byte(0xFF); write_byte(0xDB);
@@ -1008,7 +1043,11 @@ static void write_jpeg_headers(int width, int height, int quality, const struct 
     write_byte(0x00); write_byte(0x3F); write_byte(0x00);
 }
 
-static void write_jpeg_trailer(void)
+/*
+ * Writes EOI, closes the file and reports the outcome.
+ * On a latched I/O error the truncated file is removed so no corrupt JPEG is left on the card.
+ */
+static int finish_jpeg_file(const char* out_path)
 {
     flush_bits();
     write_byte(0xFF); write_byte(0xD9); // EOI
@@ -1017,9 +1056,52 @@ static void write_jpeg_trailer(void)
         FIO_CloseFile(out_file);
         out_file = NULL;
     }
+    if (io_error) {
+        printf("[JPEG_ENC] Write error, removing %s\n", out_path);
+        FIO_RemoveFile(out_path);
+        return 0;
+    }
+    return 1;
 }
 
-int encode_yuv422_to_jpeg(
+static int open_jpeg_file(const char* out_path)
+{
+    io_error = 0;
+    out_file = FIO_CreateFile(out_path);
+    if (!out_file) {
+        printf("[JPEG_ENC] Failed to create output file: %s\n", out_path);
+        return 0;
+    }
+    return 1;
+}
+
+/* Test-and-set with IRQs masked: DryOS tasks are preemptive, a plain check-then-set is racy. */
+static int encoder_try_acquire(void)
+{
+    uint32_t old = cli();
+    int acquired = !encoder_busy;
+    if (acquired) {
+        encoder_busy = 1;
+    }
+    sei(old);
+    return acquired;
+}
+
+static void encoder_release(void)
+{
+    encoder_busy = 0;
+}
+
+/* Geometry contract shared by both encoders (baseline JPEG, 4:2:2 MCU = 16x8). */
+static int jpeg_geometry_valid(int width, int height, int pitch)
+{
+    if (width < JPEG_MIN_WIDTH || width > JPEG_MAX_DIM || (width & 1)) return 0;
+    if (height < 1 || height > JPEG_MAX_DIM) return 0;
+    if (pitch < width * 2) return 0;
+    return 1;
+}
+
+static int encode_yuv422_locked(
     const uint8_t* uyvy_data,
     int width,
     int height,
@@ -1028,13 +1110,7 @@ int encode_yuv422_to_jpeg(
     const struct jpeg_exif_tags* exif,
     const char* out_path
 ) {
-    if (!uyvy_data || width <= 0 || height <= 0 || !out_path) {
-        printf("[JPEG_ENC] Invalid args: uyvy=%p w=%d h=%d path=%s\n", uyvy_data, width, height, out_path ? out_path : "NULL");
-        return 0;
-    }
-
-    out_file = FIO_CreateFile(out_path);
-    if (!out_file) {
+    if (!open_jpeg_file(out_path)) {
         return 0;
     }
 
@@ -1047,41 +1123,52 @@ int encode_yuv422_to_jpeg(
     int mcu_h = 8;
     int mcus_y = (height + mcu_h - 1) / mcu_h;
 
-    for (int my = 0; my < mcus_y; my++) {
+    for (int my = 0; my < mcus_y && !io_error; my++) {
         int py0 = my * mcu_h;
         int remaining = height - py0;
         int valid_lines = (remaining >= 8) ? 8 : remaining;
 
-        const uint8_t* row_ptr = uyvy_data + py0 * pitch;
+        const uint8_t* row_ptr = uyvy_data + (size_t)py0 * (size_t)pitch;
         encode_mcu_row(row_ptr, width, pitch, valid_lines, &prev_dc_y, &prev_dc_u, &prev_dc_v);
     }
 
-    write_jpeg_trailer();
-    return 1;
+    return finish_jpeg_file(out_path);
 }
 
-int encode_raw_fullres_to_jpeg(
+int encode_yuv422_to_jpeg(
+    const uint8_t* uyvy_data,
+    int width,
+    int height,
+    int pitch,
+    int quality,
+    const struct jpeg_exif_tags* exif,
+    const char* out_path
+) {
+    if (!uyvy_data || !out_path || !jpeg_geometry_valid(width, height, pitch)) {
+        printf("[JPEG_ENC] Invalid args: uyvy=%p w=%d h=%d pitch=%d path=%s\n",
+               uyvy_data, width, height, pitch, out_path ? out_path : "NULL");
+        return 0;
+    }
+
+    if (!encoder_try_acquire()) {
+        printf("[JPEG_ENC] Encoder busy, request refused\n");
+        return 0;
+    }
+    int ok = encode_yuv422_locked(uyvy_data, width, height, pitch, quality, exif, out_path);
+    encoder_release();
+    return ok;
+}
+
+static int encode_raw_fullres_locked(
     const struct raw_info* raw,
+    int width,
+    int height,
     int quality,
     const struct film_recipe* recipe,
     const struct jpeg_exif_tags* exif,
     const char* out_path
 ) {
-    if (!raw || !raw->buffer || !out_path) {
-        printf("[JPEG_FULLRES] Invalid args: raw=%p path=%s\n", raw, out_path ? out_path : "NULL");
-        return 0;
-    }
-
-    int width = raw->jpeg.width;
-    int height = raw->jpeg.height;
-
-    if (width <= 0) width = raw->width & ~15;
-    if (height <= 0) height = raw->height & ~7;
-    if (width > STRIP_MAX_WIDTH) width = STRIP_MAX_WIDTH;
-
-    out_file = FIO_CreateFile(out_path);
-    if (!out_file) {
-        printf("[JPEG_FULLRES] Failed to create output file: %s\n", out_path);
+    if (!open_jpeg_file(out_path)) {
         return 0;
     }
 
@@ -1096,7 +1183,7 @@ int encode_raw_fullres_to_jpeg(
     int mcus_y = (height + mcu_h - 1) / mcu_h;
     int strip_pitch = width * 2;
 
-    for (int my = 0; my < mcus_y; my++) {
+    for (int my = 0; my < mcus_y && !io_error; my++) {
         int py0 = my * mcu_h;
         debayer_raw_8lines(raw, py0, strip_buf, width, strip_pitch);
 
@@ -1111,7 +1198,46 @@ int encode_raw_fullres_to_jpeg(
         }
     }
 
-    write_jpeg_trailer();
-    bmp_printf(FONT_MED, 0, 83, "Saved Full-Res JPEG %dx%d", width, height);
-    return 1;
+    int ok = finish_jpeg_file(out_path);
+    if (ok) {
+        bmp_printf(FONT_MED, 0, 83, "Saved Full-Res JPEG %dx%d", width, height);
+    }
+    return ok;
+}
+
+int encode_raw_fullres_to_jpeg(
+    const struct raw_info* raw,
+    int quality,
+    const struct film_recipe* recipe,
+    const struct jpeg_exif_tags* exif,
+    const char* out_path
+) {
+    if (!raw || !raw->buffer || !out_path || raw->jpeg.x < 0 || raw->jpeg.y < 0) {
+        printf("[JPEG_FULLRES] Invalid args: raw=%p path=%s\n", raw, out_path ? out_path : "NULL");
+        return 0;
+    }
+
+    int width = raw->jpeg.width;
+    int height = raw->jpeg.height;
+
+    if (width <= 0) width = raw->width & ~15;
+    if (height <= 0) height = raw->height & ~7;
+    if (width > STRIP_MAX_WIDTH) width = STRIP_MAX_WIDTH;
+
+    /* debayer_raw_8lines reads whole 8-pixel blocks from (jpeg.x & ~7): stay inside the raw row. */
+    int max_width = (raw->width - (raw->jpeg.x & ~7)) & ~15;
+    if (width > max_width) width = max_width;
+
+    if (!jpeg_geometry_valid(width, height, width * 2)) {
+        printf("[JPEG_FULLRES] Invalid geometry: %dx%d\n", width, height);
+        return 0;
+    }
+
+    if (!encoder_try_acquire()) {
+        printf("[JPEG_FULLRES] Encoder busy, request refused\n");
+        return 0;
+    }
+    int ok = encode_raw_fullres_locked(raw, width, height, quality, recipe, exif, out_path);
+    encoder_release();
+    return ok;
 }
