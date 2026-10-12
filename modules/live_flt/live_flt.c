@@ -41,6 +41,9 @@
 #include <vram.h>
 #include <string.h>
 #include <beep.h>
+#include <lens.h>
+#include <shoot.h>
+#include <focus.h>
 
 /* Configuration parameters */
 static CONFIG_INT("live_flt.film_sim",   live_flt_film_sim, 0);     /* 0: Off, 1: Portra, 2: Velvia, 3: Cinestill, 4: Tri-X, 5: Classic Chrome, 6: GND, 7: ND */
@@ -65,6 +68,31 @@ static CONFIG_INT("live_flt.rec_bw_filter",  live_flt_rec_bw_filter, 0); /* 0: N
 static CONFIG_INT("live_flt.rec_halation",   live_flt_rec_halation, 0);  /* 0: Off, 1: Subtle, 2: Strong */
 static CONFIG_INT("live_flt.split_focus",    live_flt_split_focus, 0);   /* 0: Off, 1: Classic Split, 2: Split + 2x Loupe */
 static CONFIG_INT("live_flt.split_beep",     live_flt_split_beep, 1);    /* 0: Off, 1: On */
+
+/* Fast-AF (Predictive Hill-Climbing AF for Canon EF lenses in LiveView) */
+static CONFIG_INT("live_flt.fast_af_mode",   live_flt_fast_af_mode, 0);   /* 0: Off, 1: Half-Shutter, 2: SET Button, 3: Joy Center */
+static CONFIG_INT("live_flt.fast_af_stride", live_flt_fast_af_stride, 0); /* 0: Medium (Speed 2), 1: Coarse (Speed 3), 2: Fine (Speed 1) */
+static CONFIG_INT("live_flt.fast_af_range",  live_flt_fast_af_range, 0);  /* 0: Normal (40 steps), 1: Deep (65 steps) */
+static CONFIG_INT("live_flt.fast_af_box",    live_flt_fast_af_box, 1);    /* 0: Hide, 1: Show Reticle */
+static CONFIG_INT("live_flt.fast_af_beep",   live_flt_fast_af_beep, 1);   /* 0: Off, 1: On */
+
+static const char * fast_af_mode_choices[] = {
+    "OFF",
+    "Half-Shutter",
+    "SET Button",
+    "Joy Center"
+};
+
+static const char * fast_af_stride_choices[] = {
+    "Medium (Speed 2)",
+    "Coarse (Speed 3)",
+    "Fine (Speed 1)"
+};
+
+static const char * fast_af_range_choices[] = {
+    "Normal (40 steps)",
+    "Deep (65 steps)"
+};
 
 static const char * split_focus_choices[] = {
     "OFF",
@@ -144,6 +172,11 @@ static const char * gnd_soft_choices[] = {
 /* Rust Engine FFI Declarations */
 extern int rust_split_get_circle_dx(int dy);
 extern void rust_split_update_state(uint32_t q_raw, int * out_shear, uint32_t * out_score, int * out_locked);
+
+extern void rust_fast_af_reset(int stride, int max_steps);
+extern int rust_fast_af_step(uint32_t q_current, int * out_step, int * out_phase);
+extern void rust_fast_af_get_metrics(uint32_t q_current, uint32_t * out_peak_q, uint32_t * out_confidence);
+extern uint32_t rust_fast_af_eval_box(const uint32_t * vram_base, int dwords_per_row, int cx, int cy, int half_w, int half_h);
 
 extern void rust_flt_get_crop_bounds(
     uint32_t ratio,
@@ -561,9 +594,259 @@ static void apply_split_image_rangefinder(
     }
 }
 
+/* Fast-AF Runtime State */
+static volatile int fast_af_running = 0;
+static volatile int fast_af_cancel = 0;
+static volatile int fast_af_status = 0;           /* 0: Idle, 1: Hunting, 2: Locked, 3: Failed */
+static volatile uint32_t fast_af_lock_time = 0;
+static volatile uint32_t fast_af_latest_q = 0;
+static volatile uint32_t fast_af_frame_seq = 0;
+static volatile uint32_t fast_af_last_conf = 0;
+static volatile int fast_af_target_x = 360;
+static volatile int fast_af_target_y = 240;
+
+static void draw_af_reticle(
+    uint32_t * dst, int dwords_per_row, int dwords_visible,
+    int cx, int cy, int hw, int hh, int arm, uint32_t col
+)
+{
+    int x0 = cx - hw;
+    int x1 = cx + hw;
+    int y0 = cy - hh;
+    int y1 = cy + hh;
+
+    // Horizontal top & bottom bracket arms
+    int rows[2] = { y0, y1 };
+    for (int r = 0; r < 2; r++)
+    {
+        int y = rows[r];
+        uint32_t * row = dst + y * dwords_per_row;
+        // Left segment
+        int p_start_l = (x0 > 0) ? (x0 / 2) : 0;
+        int p_end_l   = ((x0 + arm) / 2);
+        for (int p = p_start_l; p <= p_end_l; p++)
+        {
+            if (p >= 0 && p < dwords_visible) row[p] = col;
+        }
+        // Right segment
+        int p_start_r = ((x1 - arm) / 2);
+        int p_end_r   = (x1 / 2);
+        for (int p = p_start_r; p <= p_end_r; p++)
+        {
+            if (p >= 0 && p < dwords_visible) row[p] = col;
+        }
+    }
+
+    // Vertical bracket arms
+    int p_left  = x0 / 2;
+    int p_right = x1 / 2;
+
+    // Top-left & top-right vertical segments
+    for (int y = y0; y <= y0 + arm; y++)
+    {
+        uint32_t * row = dst + y * dwords_per_row;
+        if (p_left >= 0 && p_left < dwords_visible) row[p_left] = col;
+        if (p_right >= 0 && p_right < dwords_visible) row[p_right] = col;
+    }
+
+    // Bottom-left & bottom-right vertical segments
+    for (int y = y1 - arm; y <= y1; y++)
+    {
+        uint32_t * row = dst + y * dwords_per_row;
+        if (p_left >= 0 && p_left < dwords_visible) row[p_left] = col;
+        if (p_right >= 0 && p_right < dwords_visible) row[p_right] = col;
+    }
+}
+
+static void apply_fast_af_frame(
+    const uint32_t * src, uint32_t * dst, int dwords_per_row, int dwords_visible, int width, int height
+)
+{
+    int af_cx = width / 2;
+    int af_cy = height / 2;
+    get_afframe_pos(width, height, &af_cx, &af_cy);
+
+    if (af_cx < 45) af_cx = 45;
+    if (af_cx > width - 45) af_cx = width - 45;
+    if (af_cy < 30) af_cy = 30;
+    if (af_cy > height - 30) af_cy = height - 30;
+
+    fast_af_target_x = af_cx;
+    fast_af_target_y = af_cy;
+
+    // 1. Evaluate high-frequency luminance gradient in 80x48 window
+    uint32_t q = rust_fast_af_eval_box(src, dwords_per_row, af_cx, af_cy, 40, 24);
+    fast_af_latest_q = q;
+    fast_af_frame_seq++;
+
+    // 2. Draw AF reticle box if enabled or active
+    int now = (int)get_ms_clock();
+    int is_locked_recent = (fast_af_status == 2 && (now - (int)fast_af_lock_time < 1500));
+    int is_failed_recent = (fast_af_status == 3 && (now - (int)fast_af_lock_time < 1500));
+
+    int show_reticle = live_flt_fast_af_box || fast_af_running || is_locked_recent || is_failed_recent;
+    if (show_reticle)
+    {
+        uint32_t col = 0xC880C880; // Neutral Gray (Idle)
+        if (fast_af_running)
+        {
+            col = 0xD29010A0; // Yellow (Active Hunting)
+        }
+        else if (is_locked_recent)
+        {
+            col = 0x91229136; // Green (Lock Confirmed)
+        }
+        else if (is_failed_recent)
+        {
+            col = 0x4C54FF4C; // Red (Failed / Inconclusive)
+        }
+
+        draw_af_reticle(dst, dwords_per_row, dwords_visible, af_cx, af_cy, 40, 24, 10, col);
+    }
+}
+
+static void fast_af_task(void * priv)
+{
+    fast_af_status = 1; // Hunting
+    fast_af_cancel = 0;
+
+    int stride_val = 2;
+    if (live_flt_fast_af_stride == 1) stride_val = 3;      // Coarse (Speed 3)
+    else if (live_flt_fast_af_stride == 2) stride_val = 1; // Fine (Speed 1)
+
+    int max_steps_val = (live_flt_fast_af_range == 1) ? 65 : 40;
+
+    rust_fast_af_reset(stride_val, max_steps_val);
+
+    uint32_t start_time = get_ms_clock();
+
+    while (1)
+    {
+        if (fast_af_cancel || !lv || is_manual_focus())
+        {
+            fast_af_status = 3;
+            fast_af_lock_time = get_ms_clock();
+            break;
+        }
+
+        if (get_ms_clock() - start_time > 2500)
+        {
+            fast_af_status = 3; // Timeout safety
+            fast_af_lock_time = get_ms_clock();
+            break;
+        }
+
+        // Synchronize with fresh LiveView frame (up to 60ms)
+        uint32_t prev_seq = fast_af_frame_seq;
+        for (int w = 0; w < 6; w++)
+        {
+            if (fast_af_frame_seq != prev_seq) break;
+            msleep(10);
+            if (fast_af_cancel || !lv || is_manual_focus()) break;
+        }
+
+        uint32_t q = fast_af_latest_q;
+        int motor_step = 0;
+        int phase = 0;
+        int action = rust_fast_af_step(q, &motor_step, &phase);
+
+        if (action == 1 /* STEP_MOTOR */)
+        {
+            if (motor_step != 0)
+            {
+                lens_focus(1, motor_step, 1, 0);
+            }
+        }
+        else if (action == 2 /* LOCK_SUCCESS */)
+        {
+            fast_af_status = 2; // Locked!
+            fast_af_lock_time = get_ms_clock();
+            uint32_t peak_q = 0, conf = 0;
+            rust_fast_af_get_metrics(q, &peak_q, &conf);
+            fast_af_last_conf = conf;
+            if (live_flt_fast_af_beep)
+            {
+                beep();
+            }
+            break;
+        }
+        else if (action == 3 /* ABORT_TIMEOUT */ || action == 4 /* ABORT_LOW_CONTRAST */)
+        {
+            fast_af_status = 3; // Inconclusive / Flat surface
+            fast_af_lock_time = get_ms_clock();
+            break;
+        }
+        else
+        {
+            msleep(20);
+        }
+    }
+
+    fast_af_running = 0;
+}
+
+static void fast_af_trigger(void)
+{
+    if (fast_af_running) return;
+    if (!lv || is_manual_focus())
+    {
+        NotifyBox(2000, "AF Error: Lens in MF or LV off");
+        return;
+    }
+    fast_af_running = 1;
+    task_create("fast_af", 0x1c, 0x1000, fast_af_task, 0);
+}
+
+static void fast_af_menu_trigger(void * priv, int delta)
+{
+    fast_af_trigger();
+}
+
+static unsigned int live_flt_keypress_cbr(unsigned int key)
+{
+    if (!lv || gui_menu_shown() || is_manual_focus()) return 1;
+
+    if (live_flt_fast_af_mode == 1) // Half-shutter
+    {
+        if (key == MODULE_KEY_PRESS_HALFSHUTTER)
+        {
+            int now = (int)get_ms_clock();
+            if (!fast_af_running && (fast_af_status != 2 || (now - (int)fast_af_lock_time > 1500)))
+            {
+                fast_af_trigger();
+            }
+        }
+        else if (key == MODULE_KEY_UNPRESS_HALFSHUTTER)
+        {
+            if (fast_af_running)
+            {
+                fast_af_cancel = 1;
+            }
+        }
+    }
+    else if (live_flt_fast_af_mode == 2) // SET button
+    {
+        if (key == MODULE_KEY_PRESS_SET)
+        {
+            fast_af_trigger();
+            return 0; // Consume event
+        }
+    }
+    else if (live_flt_fast_af_mode == 3) // Joy Center
+    {
+        if (key == MODULE_KEY_JOY_CENTER)
+        {
+            fast_af_trigger();
+            return 0; // Consume event
+        }
+    }
+
+    return 1;
+}
+
 static unsigned int live_flt_display_cbr(unsigned int ctx)
 {
-    if ((!live_flt_film_sim && !live_flt_cine_ratio && !live_flt_recipe_preset && !live_flt_split_focus) || !lv)
+    if ((!live_flt_film_sim && !live_flt_cine_ratio && !live_flt_recipe_preset && !live_flt_split_focus && !live_flt_fast_af_mode && !fast_af_running && !live_flt_fast_af_box) || !lv)
     {
         return 0;
     }
@@ -688,6 +971,11 @@ static unsigned int live_flt_display_cbr(unsigned int ctx)
         apply_split_image_rangefinder(src, dst, dwords_per_row, dwords_visible, width, height);
     }
 
+    if (live_flt_fast_af_mode || fast_af_running || live_flt_fast_af_box)
+    {
+        apply_fast_af_frame(src, dst, dwords_per_row, dwords_visible, width, height);
+    }
+
     return 1;
 }
 
@@ -732,6 +1020,41 @@ static MENU_UPDATE_FUNC(live_flt_cine_update)
     else
     {
         MENU_SET_VALUE("%s", cine_ratio_choices[live_flt_cine_ratio]);
+    }
+}
+
+static MENU_UPDATE_FUNC(fast_af_mode_update)
+{
+    MENU_SET_VALUE("%s", fast_af_mode_choices[COERCE(live_flt_fast_af_mode, 0, 3)]);
+    if (fast_af_running)
+    {
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "AF Hunting...");
+    }
+    else if (fast_af_status == 2)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "AF Locked (%d%%)", fast_af_last_conf);
+    }
+}
+
+static MENU_UPDATE_FUNC(fast_af_status_update)
+{
+    if (fast_af_running)
+    {
+        MENU_SET_VALUE("Hunting...");
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Scanning Q=%d", fast_af_latest_q);
+    }
+    else if (fast_af_status == 2)
+    {
+        MENU_SET_VALUE("Locked (Q=%d, %d%%)", fast_af_latest_q, fast_af_last_conf);
+    }
+    else if (fast_af_status == 3)
+    {
+        MENU_SET_VALUE("Failed / Timeout");
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Check scene contrast");
+    }
+    else
+    {
+        MENU_SET_VALUE("Idle (Q=%d)", fast_af_latest_q);
     }
 }
 
@@ -941,6 +1264,62 @@ static struct menu_entry live_flt_menu[] =
             MENU_EOL
         },
     },
+    {
+        .name = "Fast-AF (Predictive)",
+        .priv = &live_flt_fast_af_mode,
+        .update = fast_af_mode_update,
+        .max = 3,
+        .choices = fast_af_mode_choices,
+        .help = "Predictive Hill-Climbing LiveView AF for Canon EF lenses (<0.8s lock).",
+        .depends_on = DEP_LIVEVIEW,
+        .children = (struct menu_entry[])
+        {
+            {
+                .name = "AF Trigger Mode",
+                .priv = &live_flt_fast_af_mode,
+                .max = 3,
+                .choices = fast_af_mode_choices,
+                .help = "Select trigger key (Half-Shutter, SET button, or Joy Center).",
+            },
+            {
+                .name = "Trigger AF Now",
+                .select = fast_af_menu_trigger,
+                .help = "Run Fast-AF hill-climbing search immediately.",
+            },
+            {
+                .name = "AF Stride Speed",
+                .priv = &live_flt_fast_af_stride,
+                .max = 2,
+                .choices = fast_af_stride_choices,
+                .help = "Medium (Speed 2), Coarse (Speed 3, fastest), Fine (Speed 1, highest precision).",
+            },
+            {
+                .name = "Search Depth",
+                .priv = &live_flt_fast_af_range,
+                .max = 1,
+                .choices = fast_af_range_choices,
+                .help = "Normal (40 steps) or Deep (65 steps) search boundary.",
+            },
+            {
+                .name = "Show Target Reticle",
+                .priv = &live_flt_fast_af_box,
+                .max = 1,
+                .help = "Draw AF target brackets on LiveView screen (Green on lock).",
+            },
+            {
+                .name = "Audio Lock Beep",
+                .priv = &live_flt_fast_af_beep,
+                .max = 1,
+                .help = "Audio confirmation chirp when focus locks.",
+            },
+            {
+                .name = "AF Status & Quality",
+                .update = fast_af_status_update,
+                .help = "Real-time contrast metric and AF state.",
+            },
+            MENU_EOL
+        },
+    },
 };
 
 static unsigned int live_flt_init()
@@ -962,6 +1341,7 @@ MODULE_INFO_END()
 
 MODULE_CBRS_START()
     MODULE_CBR(CBR_DISPLAY_FILTER, live_flt_display_cbr, 0)
+    MODULE_CBR(CBR_KEYPRESS, live_flt_keypress_cbr, 0)
 MODULE_CBRS_END()
 
 MODULE_CONFIGS_START()
@@ -985,4 +1365,9 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(live_flt_rec_halation)
     MODULE_CONFIG(live_flt_split_focus)
     MODULE_CONFIG(live_flt_split_beep)
+    MODULE_CONFIG(live_flt_fast_af_mode)
+    MODULE_CONFIG(live_flt_fast_af_stride)
+    MODULE_CONFIG(live_flt_fast_af_range)
+    MODULE_CONFIG(live_flt_fast_af_box)
+    MODULE_CONFIG(live_flt_fast_af_beep)
 MODULE_CONFIGS_END()

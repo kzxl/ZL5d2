@@ -33,6 +33,8 @@ $(BUILD_DIR)/rust_flt.o: $(ZERORUST_SRC) | $(BUILD_DIR)
 		--strip-symbol=__aeabi_unwind_cpp_pr0 \
 		--keep-global-symbol=rust_flt_process_row --keep-global-symbol=rust_flt_get_crop_bounds \
 		--keep-global-symbol=rust_split_get_circle_dx --keep-global-symbol=rust_split_update_state \
+		--keep-global-symbol=rust_fast_af_reset --keep-global-symbol=rust_fast_af_step \
+		--keep-global-symbol=rust_fast_af_get_metrics --keep-global-symbol=rust_fast_af_eval_box \
 		$@.raw $@
 	@if [ -n "$$($(RUST_NM) -u $@)" ]; then echo "rust_flt.o has undefined symbols:"; $(RUST_NM) -u $@; rm -f $@; exit 1; fi
 	@rm -f $@.raw
