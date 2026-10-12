@@ -32,6 +32,7 @@ $(BUILD_DIR)/rust_flt.o: $(ZERORUST_SRC) | $(BUILD_DIR)
 	$(OBJCOPY) --remove-section=.ARM.exidx* --remove-section=.rel.ARM.exidx* \
 		--strip-symbol=__aeabi_unwind_cpp_pr0 \
 		--keep-global-symbol=rust_flt_process_row --keep-global-symbol=rust_flt_get_crop_bounds \
+		--keep-global-symbol=rust_split_get_circle_dx --keep-global-symbol=rust_split_update_state \
 		$@.raw $@
 	@if [ -n "$$($(RUST_NM) -u $@)" ]; then echo "rust_flt.o has undefined symbols:"; $(RUST_NM) -u $@; rm -f $@; exit 1; fi
 	@rm -f $@.raw

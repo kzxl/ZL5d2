@@ -63,6 +63,14 @@ static CONFIG_INT("live_flt.rec_wb_gm",      live_flt_rec_wb_gm, 0);    /* -9 ..
 static CONFIG_INT("live_flt.rec_grain",      live_flt_rec_grain, 0);    /* 0..3 */
 static CONFIG_INT("live_flt.rec_bw_filter",  live_flt_rec_bw_filter, 0); /* 0: None, 1: Yellow, 2: Orange, 3: Red, 4: Green */
 static CONFIG_INT("live_flt.rec_halation",   live_flt_rec_halation, 0);  /* 0: Off, 1: Subtle, 2: Strong */
+static CONFIG_INT("live_flt.split_focus",    live_flt_split_focus, 0);   /* 0: Off, 1: Classic Split, 2: Split + 2x Loupe */
+static CONFIG_INT("live_flt.split_beep",     live_flt_split_beep, 1);    /* 0: Off, 1: On */
+
+static const char * split_focus_choices[] = {
+    "OFF",
+    "Classic Split",
+    "Split + 2x Loupe"
+};
 
 static const char * film_sim_choices[] = {
     "OFF",
@@ -134,6 +142,9 @@ static const char * gnd_soft_choices[] = {
 };
 
 /* Rust Engine FFI Declarations */
+extern int rust_split_get_circle_dx(int dy);
+extern void rust_split_update_state(uint32_t q_raw, int * out_shear, uint32_t * out_score, int * out_locked);
+
 extern void rust_flt_get_crop_bounds(
     uint32_t ratio,
     int width,
@@ -430,9 +441,129 @@ static void recipe_inspect_curve(void * priv, int delta)
     task_create("curve_insp", 0x1c, 0x2000, recipe_inspect_curve_task, 0);
 }
 
+static void apply_split_image_rangefinder(
+    const uint32_t * src, uint32_t * dst, int dwords_per_row, int dwords_visible, int width, int height
+)
+{
+    if (!live_flt_split_focus) return;
+
+    int xc = width / 2;
+    int yc = height / 2;
+    int R = 56;
+
+    if (yc - R < 2 || yc + R >= height - 2 || xc - R < 2 || xc + R >= width - 2) return;
+
+    // 1. Measure raw edge gradient sum in central focus rectangle [xc - 32 .. xc + 32, yc - 24 .. yc + 24]
+    uint32_t q_raw = 0;
+    int start_p = (xc - 32) / 2;
+    int end_p   = (xc + 32) / 2;
+    for (int gy = yc - 24; gy <= yc + 24; gy += 2)
+    {
+        const uint32_t * r = src + gy * dwords_per_row;
+        for (int p = start_p; p < end_p; p++)
+        {
+            uint32_t c0 = r[p - 1];
+            uint32_t c1 = r[p];
+            int y_prev1 = (int)((c0 >> 24) & 0xFF);
+            int y_curr0 = (int)((c1 >> 8) & 0xFF);
+            int y_curr1 = (int)((c1 >> 24) & 0xFF);
+            int d0 = y_curr0 - y_prev1;
+            int d1 = y_curr1 - y_curr0;
+            if (d0 < 0) d0 = -d0;
+            if (d1 < 0) d1 = -d1;
+            q_raw += (uint32_t)(d0 + d1);
+        }
+    }
+
+    // 2. Update state via Rust engine
+    int shear_offset = 0;
+    uint32_t focus_score = 0;
+    int is_locked = 0;
+    rust_split_update_state(q_raw, &shear_offset, &focus_score, &is_locked);
+
+    static int prev_locked = 0;
+    if (is_locked && !prev_locked && live_flt_split_beep)
+    {
+        beep();
+    }
+    prev_locked = is_locked;
+
+    // 3. Render Split Prism inside the circular reticle
+    // Green: Y=145, U=54, V=34 -> 0x91229136
+    // Gray:  Y=200, U=128, V=128 -> 0xC880C880
+    // Dark:  Y=32, U=128, V=128 -> 0x20802080
+    uint32_t border_col = is_locked ? 0x91229136 : 0xC880C880;
+    uint32_t split_line_col = 0x20802080;
+    int shear_pairs = shear_offset / 2;
+    int is_loupe = (live_flt_split_focus == 2);
+
+    for (int dy = -R; dy <= R; dy++)
+    {
+        int y = yc + dy;
+        int dx = rust_split_get_circle_dx(dy);
+        if (dx <= 0) continue;
+
+        int x0 = xc - dx;
+        int x1 = xc + dx;
+        int p0 = x0 / 2;
+        int p1 = x1 / 2;
+
+        uint32_t * row_dst = dst + y * dwords_per_row;
+
+        if (dy == 0)
+        {
+            // Center horizontal crosshair
+            for (int p = p0; p <= p1; p++)
+            {
+                row_dst[p] = split_line_col;
+            }
+        }
+        else
+        {
+            if (is_loupe)
+            {
+                // 2x Loupe mode: sample central lines around yc with 2x zoom
+                int sample_y = yc + (dy / 2);
+                const uint32_t * row_sample = src + sample_y * dwords_per_row;
+                for (int p = p0; p <= p1; p++)
+                {
+                    int x_rel = (p * 2) - xc;
+                    int src_x = xc + (x_rel / 2);
+                    if (dy > 0 && shear_offset > 0)
+                    {
+                        src_x -= shear_offset;
+                    }
+                    int src_p = src_x / 2;
+                    if (src_p >= 0 && src_p < dwords_visible)
+                    {
+                        row_dst[p] = row_sample[src_p];
+                    }
+                }
+            }
+            else if (dy > 0 && shear_pairs > 0)
+            {
+                // 1x Classic Split: horizontal shear on bottom half
+                const uint32_t * row_src = src + y * dwords_per_row;
+                for (int p = p0; p <= p1; p++)
+                {
+                    int src_p = p - shear_pairs;
+                    if (src_p >= 0 && src_p < dwords_visible)
+                    {
+                        row_dst[p] = row_src[src_p];
+                    }
+                }
+            }
+        }
+
+        // Circular reticle border
+        if (p0 >= 0 && p0 < dwords_visible) row_dst[p0] = border_col;
+        if (p1 >= 0 && p1 < dwords_visible) row_dst[p1] = border_col;
+    }
+}
+
 static unsigned int live_flt_display_cbr(unsigned int ctx)
 {
-    if ((!live_flt_film_sim && !live_flt_cine_ratio && !live_flt_recipe_preset) || !lv)
+    if ((!live_flt_film_sim && !live_flt_cine_ratio && !live_flt_recipe_preset && !live_flt_split_focus) || !lv)
     {
         return 0;
     }
@@ -550,6 +681,11 @@ static unsigned int live_flt_display_cbr(unsigned int ctx)
         {
             memcpy(row_dst + dwords_visible, row_src + dwords_visible, (dwords_per_row - dwords_visible) * sizeof(uint32_t));
         }
+    }
+
+    if (live_flt_split_focus)
+    {
+        apply_split_image_rangefinder(src, dst, dwords_per_row, dwords_visible, width, height);
     }
 
     return 1;
@@ -780,6 +916,31 @@ static struct menu_entry live_flt_menu[] =
             MENU_EOL
         },
     },
+    {
+        .name = "Split Rangefinder",
+        .priv = &live_flt_split_focus,
+        .max = 2,
+        .choices = split_focus_choices,
+        .help = "Digital split-image focusing screen for manual vintage lenses.",
+        .depends_on = DEP_LIVEVIEW,
+        .children = (struct menu_entry[])
+        {
+            {
+                .name = "Split Mode",
+                .priv = &live_flt_split_focus,
+                .max = 2,
+                .choices = split_focus_choices,
+                .help = "Select split prism mode (1x Classic or 2x Loupe).",
+            },
+            {
+                .name = "Focus Lock Beep",
+                .priv = &live_flt_split_beep,
+                .max = 1,
+                .help = "Audio confirmation chirp when focus locks.",
+            },
+            MENU_EOL
+        },
+    },
 };
 
 static unsigned int live_flt_init()
@@ -822,4 +983,6 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(live_flt_rec_grain)
     MODULE_CONFIG(live_flt_rec_bw_filter)
     MODULE_CONFIG(live_flt_rec_halation)
+    MODULE_CONFIG(live_flt_split_focus)
+    MODULE_CONFIG(live_flt_split_beep)
 MODULE_CONFIGS_END()
