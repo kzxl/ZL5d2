@@ -96,6 +96,34 @@ typedef struct {
 
 static uint16_t qtab_y[64];
 static uint16_t qtab_c[64];
+
+/*
+ * Inverse of zigzag[]: maps a natural (row-major) coefficient index to its
+ * position in the zigzag-ordered entropy stream.
+ */
+static const uint8_t natural_to_zigzag[64] = {
+     0,  1,  5,  6, 14, 15, 27, 28,
+     2,  4,  7, 13, 16, 26, 29, 42,
+     3,  8, 12, 17, 25, 30, 41, 43,
+     9, 11, 18, 24, 31, 40, 44, 53,
+    10, 19, 23, 32, 39, 45, 52, 54,
+    20, 22, 33, 38, 46, 51, 55, 60,
+    21, 34, 37, 47, 50, 56, 59, 61,
+    35, 36, 48, 49, 57, 58, 62, 63
+};
+
+/*
+ * Quantisation reciprocals in natural order, Q(RECIP_BITS) fixed point.
+ * Each entry folds the quantiser step, the AAN output scale
+ * (8 * aan[row] * aan[col]) and the FDCT input pre-scale (1 << FDCT_PASS_BITS),
+ * so the hot loop needs one 32x32->64 multiply instead of a division.
+ */
+#define FDCT_PASS_BITS 2
+#define RECIP_BITS 24
+#define AC_COEF_LIMIT 1023
+#define DC_COEF_LIMIT 2047
+static int32_t recip_y[64];
+static int32_t recip_c[64];
 static huff_code_t huff_dc_lum[16];
 static huff_code_t huff_dc_chrom[16];
 static huff_code_t huff_ac_lum[256];
@@ -215,6 +243,24 @@ static void build_huff_table(const uint8_t* bits, const uint8_t* val, int val_co
     }
 }
 
+static void build_recip_table(const uint16_t* qtab, int32_t* recip) {
+    /* AAN output scale factors: aan[0] = 1, aan[k] = sqrt(2) * cos(k * pi / 16). */
+    static const float aan_scale[8] = {
+        1.0f, 1.387039845f, 1.306562965f, 1.175875602f,
+        1.0f, 0.785694958f, 0.541196100f, 0.275899379f
+    };
+    const float pre_scale = (float)(8 << FDCT_PASS_BITS);
+    const float one = (float)(1 << RECIP_BITS);
+
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 8; col++) {
+            int n = row * 8 + col;
+            float divisor = (float)qtab[n] * aan_scale[row] * aan_scale[col] * pre_scale;
+            recip[n] = (int32_t)(one / divisor + 0.5f);
+        }
+    }
+}
+
 static void init_tables(int quality) {
     if (quality < 1) quality = 1;
     if (quality > 100) quality = 100;
@@ -231,6 +277,9 @@ static void init_tables(int quality) {
         if (v_c > 255) v_c = 255;
         qtab_c[i] = v_c;
     }
+
+    build_recip_table(qtab_y, recip_y);
+    build_recip_table(qtab_c, recip_c);
 
     memset(huff_dc_lum, 0, sizeof(huff_dc_lum));
     memset(huff_dc_chrom, 0, sizeof(huff_dc_chrom));
@@ -289,12 +338,19 @@ static void fdct_1d(int32_t* data) {
     data[7] = (z11 - z4);
 }
 
-// 2D FDCT on 8x8 block
-static void fdct_2d(int16_t* in, int16_t* out, const uint16_t* qtable) {
-    // Rows
+static inline int16_t quantize_coef(int32_t coef, int32_t recip, int limit) {
+    int32_t mag = (coef < 0) ? -coef : coef;
+    int32_t q = (int32_t)(((int64_t)mag * recip + (1 << (RECIP_BITS - 1))) >> RECIP_BITS);
+    if (q > limit) q = limit;
+    return (int16_t)((coef < 0) ? -q : q);
+}
+
+// 2D AAN FDCT on an 8x8 block, quantised and written in zigzag order.
+static void fdct_2d(const int16_t* in, int16_t* out, const int32_t* recip) {
+    // Rows (input pre-scaled to keep precision through the fixed-point butterflies)
     for (int i = 0; i < 8; i++) {
         for (int j = 0; j < 8; j++) {
-            dct_workspace[i * 8 + j] = in[i * 8 + j];
+            dct_workspace[i * 8 + j] = (int32_t)in[i * 8 + j] << FDCT_PASS_BITS;
         }
         fdct_1d(&dct_workspace[i * 8]);
     }
@@ -305,10 +361,9 @@ static void fdct_2d(int16_t* in, int16_t* out, const uint16_t* qtable) {
         for (int i = 0; i < 8; i++) col[i] = dct_workspace[i * 8 + j];
         fdct_1d(col);
         for (int i = 0; i < 8; i++) {
-            int32_t val = (col[i] + 4) >> 3; // rescale
-            int q = qtable[zigzag[i * 8 + j]];
-            int qval = (val >= 0) ? (val + q / 2) / q : (val - q / 2) / q;
-            out[zigzag[i * 8 + j]] = (int16_t)qval;
+            int n = i * 8 + j;
+            int limit = (n == 0) ? DC_COEF_LIMIT : AC_COEF_LIMIT;
+            out[natural_to_zigzag[n]] = quantize_coef(col[i], recip[n], limit);
         }
     }
 }
@@ -713,19 +768,19 @@ static void encode_mcu_row(
         }
 
         // Encode Y0 (8x8)
-        fdct_2d(y0_block, q_block, qtab_y);
+        fdct_2d(y0_block, q_block, recip_y);
         encode_block(q_block, p_prev_dc_y, huff_dc_lum, huff_ac_lum);
 
         // Encode Y1 (8x8)
-        fdct_2d(y1_block, q_block, qtab_y);
+        fdct_2d(y1_block, q_block, recip_y);
         encode_block(q_block, p_prev_dc_y, huff_dc_lum, huff_ac_lum);
 
         // Encode Cb/U (8x8)
-        fdct_2d(u_block, q_block, qtab_c);
+        fdct_2d(u_block, q_block, recip_c);
         encode_block(q_block, p_prev_dc_u, huff_dc_chrom, huff_ac_chrom);
 
         // Encode Cr/V (8x8)
-        fdct_2d(v_block, q_block, qtab_c);
+        fdct_2d(v_block, q_block, recip_c);
         encode_block(q_block, p_prev_dc_v, huff_dc_chrom, huff_ac_chrom);
     }
 }
