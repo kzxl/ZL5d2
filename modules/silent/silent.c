@@ -164,7 +164,7 @@ static void get_effective_film_recipe(struct film_recipe * r)
         struct config_var * v_rec = module_get_config_var("live_flt.recipe_preset");
         int preset = (v_rec && v_rec->value) ? *(v_rec->value) : 0;
 
-        if (preset > 0 && preset <= 4)
+        if (preset > 0 && preset <= 7)
         {
             r->active = 1;
             switch (preset)
@@ -190,10 +190,27 @@ static void get_effective_film_recipe(struct film_recipe * r)
                     r->bw_filter = 3; /* Red #25A contrast for Tri-X push */
                     r->name = "Tri-X Push 2";
                     break;
+                case 5:
+                    r->base_stock = 3; r->highlight = -1; r->shadow = 1;
+                    r->saturation = 1; r->wb_ab = -3; r->wb_gm = -1; r->grain = 2;
+                    r->halation = 2;
+                    r->name = "CineStill Night";
+                    break;
+                case 6:
+                    r->base_stock = 4; r->highlight = 0; r->shadow = 1;
+                    r->saturation = 0; r->wb_ab = 0; r->wb_gm = 0; r->grain = 2;
+                    r->bw_filter = 1; /* Yellow #8 */
+                    r->name = "Ilford HP5 Plus";
+                    break;
+                case 7:
+                    r->base_stock = 5; r->highlight = 1; r->shadow = 0;
+                    r->saturation = 1; r->wb_ab = 2; r->wb_gm = 1; r->grain = 1;
+                    r->name = "Agfa Vista 200";
+                    break;
             }
             return;
         }
-        else if (preset == 5) /* Custom Recipe */
+        else if (preset == 8) /* Custom Recipe */
         {
             r->active = 1;
             r->name = "Custom Recipe";

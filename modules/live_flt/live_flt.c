@@ -56,7 +56,7 @@ static CONFIG_INT("live_flt.nd_ev",      live_flt_nd_ev, 3);        /* 1 to 6 st
 static CONFIG_INT("live_flt.osd_badge",  live_flt_osd_badge, 1);    /* Show OSD badge */
 
 /* Custom Film Recipe configuration */
-static CONFIG_INT("live_flt.recipe_preset", live_flt_recipe_preset, 0); /* 0: Off, 1: Portra Warm, 2: Fuji Superia, 3: Kodachrome 64, 4: Tri-X Push 2, 5: Custom */
+static CONFIG_INT("live_flt.recipe_preset", live_flt_recipe_preset, 0); /* 0: Off, 1: Portra Warm, 2: Fuji Superia, 3: Kodachrome 64, 4: Tri-X Push 2, 5: CineStill Night, 6: Ilford HP5 Plus, 7: Agfa Vista 200, 8: Custom */
 static CONFIG_INT("live_flt.rec_base",       live_flt_rec_base, 0);     /* 0: Portra, 1: Velvia, 2: Cinestill, 3: Tri-X, 4: Classic Chrome */
 static CONFIG_INT("live_flt.rec_high",       live_flt_rec_high, 0);     /* -2 .. +2 */
 static CONFIG_INT("live_flt.rec_shadow",     live_flt_rec_shadow, 0);   /* -2 .. +2 */
@@ -117,6 +117,9 @@ static const char * recipe_preset_choices[] = {
     "Fuji Superia",
     "Kodachrome 64",
     "Tri-X Push 2",
+    "CineStill Night",
+    "Ilford HP5 Plus",
+    "Agfa Vista 200",
     "Custom Recipe"
 };
 
@@ -270,7 +273,42 @@ static void get_effective_recipe_params(
             if (name) *name = "Tri-X Push 2";
             break;
 
-        case 5: // Custom
+        case 5: // CineStill Night
+            *base = 3; // Cinestill 800T
+            *high = -1;
+            *shadow = 1;
+            *sat = 1;
+            *wb_ab = -3;
+            *wb_gm = -1;
+            *grain = 2;
+            def_hal = 2; // Strong halation glow around neon/street lights
+            if (name) *name = "CineStill Night";
+            break;
+
+        case 6: // Ilford HP5 Plus
+            *base = 4; // Kodak Tri-X 400 (monochrome)
+            *high = 0;
+            *shadow = 1;
+            *sat = 0;
+            *wb_ab = 0;
+            *wb_gm = 0;
+            *grain = 2;
+            def_bw = 1; // Yellow #8 classic cloud and portrait filter
+            if (name) *name = "Ilford HP5 Plus";
+            break;
+
+        case 7: // Agfa Vista 200
+            *base = 5; // Classic Chrome
+            *high = 1;
+            *shadow = 0;
+            *sat = 1;
+            *wb_ab = 2;
+            *wb_gm = 1;
+            *grain = 1;
+            if (name) *name = "Agfa Vista 200";
+            break;
+
+        case 8: // Custom
             *base = live_flt_rec_base + 1; // 0..4 mapped to 1..5
             *high = live_flt_rec_high;
             *shadow = live_flt_rec_shadow;
@@ -373,7 +411,7 @@ static void recipe_load_custom(void * priv, int delta)
     live_flt_rec_grain = COERCE(live_flt_rec_grain, 0, 3);
     live_flt_rec_bw_filter = COERCE(live_flt_rec_bw_filter, 0, 4);
     live_flt_rec_halation  = COERCE(live_flt_rec_halation, 0, 2);
-    live_flt_recipe_preset = 5; // Custom
+    live_flt_recipe_preset = 8; // Custom
     beep();
     bmp_printf(FONT_MED, 0, 60, "Loaded CUSTOM.REC");
 }
@@ -1041,7 +1079,7 @@ static MENU_UPDATE_FUNC(live_flt_recipe_update)
     }
     else
     {
-        MENU_SET_VALUE("%s", recipe_preset_choices[COERCE(live_flt_recipe_preset, 0, 5)]);
+        MENU_SET_VALUE("%s", recipe_preset_choices[COERCE(live_flt_recipe_preset, 0, 8)]);
     }
 }
 
@@ -1146,7 +1184,7 @@ static struct menu_entry live_flt_menu[] =
         .name = "Film Recipes",
         .priv = &live_flt_recipe_preset,
         .update = live_flt_recipe_update,
-        .max = 5,
+        .max = 8,
         .choices = recipe_preset_choices,
         .help = "Fujifilm-style custom film recipes (tone curves, WB shift, grain).",
         .depends_on = DEP_LIVEVIEW,
@@ -1155,7 +1193,7 @@ static struct menu_entry live_flt_menu[] =
             {
                 .name = "Preset",
                 .priv = &live_flt_recipe_preset,
-                .max = 5,
+                .max = 8,
                 .choices = recipe_preset_choices,
                 .help = "Select film recipe preset or Custom.",
             },

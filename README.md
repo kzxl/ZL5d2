@@ -50,6 +50,15 @@
   - `Kodak Tri-X 400`: Classic high-contrast street monochrome with push-processing support.
   - `Classic Chrome`: Muted documentary palette with deep shadow contrast.
 * **Custom Film Recipes**:
+  - **7 Built-in Film Stocks**:
+    - `Portra Warm`: Soft warm skin tones with delicate pastel highlights.
+    - `Fuji Superia`: Vibrant daylight color negative with rich green saturation.
+    - `Kodachrome 64`: High-contrast vintage slide film look with deep reds.
+    - `Tri-X Push 2`: High-contrast pushed street monochrome with Red #25A contrast filter.
+    - `CineStill Night`: Cool tungsten shadow bias with rich neon highlight halation bloom.
+    - `Ilford HP5 Plus`: Classic fine-grain documentary monochrome with Yellow #8 cloud contrast filter.
+    - `Agfa Vista 200`: Warm, punchy consumer negative color palette.
+    - `Custom Recipe`: Fully customizable user profile, persistent on CF card.
   - Independent Highlight and Shadow rolloff adjustment (`-2` to `+2`).
   - Warm/Cool (A/B) and Green/Magenta (G/M) white balance bias shifting (`-9` to `+9`).
   - Pseudo-random LFSR analog film grain generator (Subtle, Moderate, Heavy).
@@ -137,7 +146,18 @@ During build, `modules/live_flt/Makefile` automatically links static object `rus
 
 ---
 
-## 4. Building & Testing
+## 4. Quick Start & Installation
+
+For photographer end-users wishing to run ZeroLantern on physical hardware without compiling from source:
+
+1. **Download the Ready-to-Flash Release**:
+   - Download the pre-built distribution [`release/ZeroLantern-5D2.212-StillPhoto.zip`](release/ZeroLantern-5D2.212-StillPhoto.zip).
+2. **Step-by-Step Hardware Guide**:
+   - Follow the comprehensive installation walkthrough in [**`docs/INSTALL.md`**](docs/INSTALL.md) to format your CF card, enable the bootflag via `ML-SETUP.FIR`, and configure optimal still photography defaults.
+
+---
+
+## 5. Building & Testing
 
 ### Prerequisites
 * **ARM Toolchain**: `arm-none-eabi-gcc` (GCC 12.2+ recommended)
@@ -169,7 +189,7 @@ python tests/qemu/test_capture_concurrency.py
 
 ---
 
-## 5. Legal, License & Attribution Notices
+## 6. Legal, License & Attribution Notices
 
 ### 📜 Magic Lantern Base License (GNU GPL v2)
 * This project incorporates and derives from the **Magic Lantern** firmware enhancement framework:
