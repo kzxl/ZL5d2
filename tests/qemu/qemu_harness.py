@@ -49,7 +49,7 @@ def deploy_modules(*names):
 
 def reset_card(module_configs):
     """Removes captures, logs and settings, then writes the given module configs."""
-    for path in ("::/ML/MODULES/LOADING.LCK", "::/ML/SETTINGS/MAGIC.CFG", "::/ML/SETTINGS/MENUS.CFG",
+    for path in ("::/ML/MODULES/LOADING.LCK", "::/ML/SETTINGS/*.CFG",
                  "::/SILENT.LOG", f"{DCIM}*.JPG", f"{DCIM}*.DNG"):
         wsl("mdel", "-i", CF, path)
     for file_name, lines in module_configs.items():

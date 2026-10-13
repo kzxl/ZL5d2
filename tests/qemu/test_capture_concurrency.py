@@ -28,7 +28,7 @@ SILENT_BASE = [
     "# Config file for module silent (SILENT.MO)",
     "silent.pic = 1",
     "silent.pic.file_format = 3",  # JPEG
-    "silent.pic.film_sim = 0",
+    "silent.pic.film_sim = 1",  # 1: Off (ensures ungraded baseline)
     "silent.pic.quality = 1",
 ]
 BRACKET_3 = ["silent.bracket_steps = 1", "silent.bracket_stepsize = 0"]  # 3 frames, 1 EV
