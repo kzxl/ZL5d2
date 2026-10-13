@@ -48,6 +48,7 @@ static CONFIG_INT( "silent.pic", silent_pic_enabled, 0 );
 static CONFIG_INT( "silent.pic.mode", silent_pic_mode, 0 );
 static CONFIG_INT( "silent.pic.slitscan.mode", silent_pic_slitscan_mode, 0 );
 static CONFIG_INT( "silent.pic.fullres.trigger", silent_pic_fullres_trigger_mode, 0 );
+static CONFIG_INT( "silent.burst_fps", silent_burst_fps_idx, 0 ); /* 0: 5.0 FPS (Optimal), 1: 3.0 FPS (Eco), 2: 2.0 FPS (Paced), 3: Max (Uncapped) */
 static CONFIG_INT( "silent.pic.file_format", silent_pic_file_format, 0 );
 static CONFIG_INT( "silent.pic.film_sim", silent_pic_film_sim, 0 );
 static CONFIG_INT( "silent.pic.quality", silent_pic_quality, 1 ); // 0: 70%, 1: 85%, 2: 95%, 3: 98%
@@ -56,6 +57,20 @@ static CONFIG_INT( "silent.multiexp", silent_pic_multiexp, 0 );
 static CONFIG_INT( "silent.multiexp_blend", silent_pic_multiexp_blend, 0 );
 static CONFIG_INT( "silent.bracket_steps", silent_pic_bracket_steps, 0 );
 static CONFIG_INT( "silent.bracket_stepsize", silent_pic_bracket_stepsize, 0 );
+
+static const char * burst_fps_choices[] = { "5.0 FPS (Optimal)", "3.0 FPS (Eco)", "2.0 FPS (Paced)", "Max (Uncapped)" };
+
+static int get_burst_interval_ms(void)
+{
+    switch (silent_burst_fps_idx)
+    {
+        case 0: return 200;  /* 5.0 FPS: Optimal Golden Standard (thermal equilibrium & AF settling) */
+        case 1: return 333;  /* 3.0 FPS: Eco mode for prolonged cool operation */
+        case 2: return 500;  /* 2.0 FPS: Paced sequence capture */
+        case 3: return 0;    /* Max: Uncapped hardware rate */
+        default: return 200;
+    }
+}
 
 static const char * multiexp_choices[] = { "OFF", "2 Frames", "3 Frames", "4 Frames", "8 Frames (ND)" };
 static const char * multiexp_blend_choices[] = { "Average", "Additive", "Screen" };
@@ -377,10 +392,10 @@ static struct menu_entry silent_menu[];
 static MENU_UPDATE_FUNC(silent_pic_mode_update)
 {
     /* reveal options for the current shooting mode, if any */
-    silent_menu[0].children[1].shidden =
+    silent_menu[0].children[2].shidden =
         (silent_pic_mode != SILENT_PIC_MODE_SLITSCAN);
 
-    silent_menu[0].children[2].shidden =
+    silent_menu[0].children[3].shidden =
         (silent_pic_mode != SILENT_PIC_MODE_FULLRES);
 }
 
@@ -417,7 +432,9 @@ static MENU_UPDATE_FUNC(silent_pic_display)
             break;
 
         case SILENT_PIC_MODE_BURST:
-            MENU_SET_VALUE("Burst");
+            MENU_SET_VALUE("Burst (%s)", (silent_burst_fps_idx == 0) ? "5 FPS" :
+                                         (silent_burst_fps_idx == 1) ? "3 FPS" :
+                                         (silent_burst_fps_idx == 2) ? "2 FPS" : "Max");
             break;
 
         case SILENT_PIC_MODE_BURST_END_TRIGGER:
@@ -1305,6 +1322,17 @@ static unsigned int silent_pic_raw_vsync(unsigned int ctx)
         sp_running = 0;
         return 0;
     }
+
+    /* Burst FPS Governor: enforce minimum interval between frame captures */
+    static int sp_last_frame_clock = 0;
+    int interval_ms = get_burst_interval_ms();
+    if (interval_ms > 0 && sp_num_frames > 0)
+    {
+        if ((uint32_t)(get_ms_clock() - sp_last_frame_clock) < (uint32_t)interval_ms)
+        {
+            return 0; /* Wait for next VSYNC to pace at target FPS */
+        }
+    }
     
     int next_slot = sp_num_frames % sp_buffer_count;
     
@@ -1316,6 +1344,7 @@ static unsigned int silent_pic_raw_vsync(unsigned int ctx)
     /* Reprogram the raw EDMAC to output the data in our buffer (ptr) */
     raw_lv_redirect_edmac(sp_frames[next_slot % sp_buffer_count]);
     sp_num_frames++;
+    sp_last_frame_clock = get_ms_clock();
     
     bmp_printf(FONT_MED, 0, 60, "Capturing frame %d...", sp_num_frames);
     return 0;
@@ -2360,8 +2389,25 @@ static unsigned int silent_pic_polling_cbr(unsigned int ctx)
         }
     }
 
+    static int last_continuous_shot_clock = 0;
+
+    if (!get_halfshutter_pressed())
+    {
+        last_continuous_shot_clock = 0;
+    }
+
     if (lv && get_halfshutter_pressed())
     {
+        /* Burst FPS Governor: pace continuous shots when half-shutter is held */
+        int interval_ms = get_burst_interval_ms();
+        if (interval_ms > 0 && last_continuous_shot_clock != 0)
+        {
+            if ((uint32_t)(get_ms_clock() - last_continuous_shot_clock) < (uint32_t)interval_ms)
+            {
+                return 0;
+            }
+        }
+
         /* half-shutter was pressed while in playback mode, for example */
         if (silent_pic_countdown)
         {
@@ -2410,6 +2456,7 @@ static unsigned int silent_pic_polling_cbr(unsigned int ctx)
         }
 
         silent_pic_take(1);
+        last_continuous_shot_clock = get_ms_clock();
     }
     
     if (LV_PAUSED && get_halfshutter_pressed())
@@ -2430,6 +2477,7 @@ static unsigned int silent_pic_polling_cbr(unsigned int ctx)
         info_led_off();
         
         silent_pic_take(1);
+        last_continuous_shot_clock = get_ms_clock();
     }
     
     return 0;
@@ -2692,6 +2740,17 @@ static struct menu_entry silent_menu[] = {
                 .shidden = 1,   /* enabled only when choosing full-res */
             },
             {
+                .name = "Burst Governor",
+                .priv = &silent_burst_fps_idx,
+                .max = 3,
+                .choices = burst_fps_choices,
+                .help = "Continuous burst rate governor (sensor & CF protection).",
+                .help2 = "5.0 FPS: Optimal balance of thermal equilibrium, AF tracking & CF bandwidth.\n"
+                         "3.0 FPS: Eco mode for prolonged continuous shooting and cool operation.\n"
+                         "2.0 FPS: Slow paced sequence capture.\n"
+                         "Max: Uncapped hardware rate (may warm sensor during long bursts).\n",
+            },
+            {
                 .name = "File Format",
                 .update = silent_pic_file_format_display,
                 .priv = &silent_pic_file_format,
@@ -2847,8 +2906,8 @@ static unsigned int silent_init()
 
     if (!is_camera("5D3",  "*"))
     {
-        /* Full-res LV not available; hide from menu */
-        silent_menu[0].children[0].max = 5;
+        /* Full-res LV not available; hide from menu (index 1 is Silent Mode) */
+        silent_menu[0].children[1].max = 5;
     }
 
     menu_add("Shoot", silent_menu, COUNT(silent_menu));
@@ -2883,6 +2942,7 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(silent_pic_mode)
     MODULE_CONFIG(silent_pic_slitscan_mode)
     MODULE_CONFIG(silent_pic_fullres_trigger_mode)
+    MODULE_CONFIG(silent_burst_fps_idx)
     MODULE_CONFIG(silent_pic_file_format)
     MODULE_CONFIG(silent_pic_film_sim)
     MODULE_CONFIG(silent_pic_quality)
