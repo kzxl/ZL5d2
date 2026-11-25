@@ -1,7 +1,14 @@
 # ZeroLantern 5D2 ⚡📷
 
+[![Camera](https://img.shields.io/badge/Camera-Canon%20EOS%205D%20Mark%20II%20(v2.1.2)-CC0000?style=flat-square)](platform/5D2.212)
+[![Stack](https://img.shields.io/badge/Stack-C%20%2B%20Safe%20Rust%20(no__std)-DEA584?style=flat-square&logo=rust)](rust/README.md)
+[![License](https://img.shields.io/badge/License-GPL--2.0%20%2F%20MIT%20(Rust)-blue?style=flat-square)](COPYING)
+[![GitHub stars](https://img.shields.io/github/stars/kzxl/ZL5d2?style=social)](https://github.com/kzxl/ZL5d2/stargazers)
+
 > **Dedicated Still Photography OS & Safe Rust Extension for Canon EOS 5D Mark II (DIGIC IV).**  
-> Engineered by **ZeroUniverse** in collaboration with the open-source **Magic Lantern** community.
+> Built on the open-source **Magic Lantern** framework — video subsystems stripped out, pure still-photography workflow and analog film science engineered in.
+
+[Visual Showcase](#visual-showcase) · [Capabilities](#2-key-photographic-capabilities) · [Quick Install](#4-quick-start--installation) · [Architecture](#3-architecture--repository-layout) · [Build & Test](#5-building--testing)
 
 ---
 
@@ -169,12 +176,15 @@ For photographer end-users wishing to run ZeroLantern on physical hardware witho
 ### Build Commands
 
 ```bash
+# Set your ARM GNU toolchain bin directory
+export ARM_BINPATH=/path/to/arm-gnu-toolchain/bin
+
 # 1. Build Still Photography Modules (using ARM toolchain)
-make -C modules/silent ARM_BINPATH=E:/Tools/arm-gnu-toolchain/bin
-make -C modules/live_flt ARM_BINPATH=E:/Tools/arm-gnu-toolchain/bin
+make -C modules/silent ARM_BINPATH="$ARM_BINPATH"
+make -C modules/live_flt ARM_BINPATH="$ARM_BINPATH"
 
 # 2. Build 5D Mark II Firmware
-make -C platform/5D2.212 ARM_BINPATH=E:/Tools/arm-gnu-toolchain/bin
+make -C platform/5D2.212 ARM_BINPATH="$ARM_BINPATH"
 ```
 
 ### Test Verification
@@ -204,3 +214,7 @@ python tests/qemu/test_capture_concurrency.py
 ### ⚖️ Trademark & Clean-Room Disclaimer
 * "Canon", "EOS", "5D Mark II", "DryOS", and "DIGIC" are registered trademarks of **Canon Inc.**
 * This project is an independent, non-commercial research and open-source compatibility project developed through clean-room interoperability methods. It is **not** endorsed by, affiliated with, or sponsored by Canon Inc.
+
+---
+
+Still shooting on a classic Canon 5D Mark II? Give the project a ⭐ on GitHub to follow new film recipes and firmware releases!
